@@ -1,0 +1,9 @@
+# bdv (BizDevVibes) runtime dependencies.
+#
+# Intentionally empty: the game engine is pure standard-library Python
+# (dataclasses, decimal, hashlib, json, random), and Flask / SQLAlchemy /
+# Alembic already come from vbwd-backend's own requirements.
+#
+# The file is kept present rather than absent so the test image's
+# `for r in plugins/*/requirements.txt` loop stays well-formed when bdv is the
+# only plugin checked out in per-plugin CI.
