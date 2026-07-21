@@ -1,0 +1,116 @@
+name: Tests
+
+# Public-repo security posture: no `pull_request_target`, no self-hosted
+# runners, no secrets used by any job — a fork PR can never reach a credential.
+on:
+  push:
+    branches: ['*']
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+jobs:
+  ci:
+    name: CI — bdv (lint + unit)
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Clone vbwd-backend
+        uses: actions/checkout@v4
+        with:
+          repository: VBWD-platform/vbwd-backend
+          ref: main
+          path: vbwd-backend
+
+      # The on-disk dir MUST be the Python package name `bdv` — runtime imports
+      # `plugins.bdv`, and the repo suffix happens to match here.
+      - name: Clone plugin
+        uses: actions/checkout@v4
+        with:
+          path: vbwd-backend/plugins/bdv
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+          cache-dependency-path: vbwd-backend/requirements.txt
+
+      - name: Install Python dependencies
+        run: pip install -r vbwd-backend/requirements.txt
+
+      - name: Style check — Black
+        run: black --check --diff vbwd-backend/plugins/bdv/ --exclude='/(\.git|__pycache__|\.pytest_cache)/'
+
+      - name: Style check — Flake8
+        run: flake8 vbwd-backend/plugins/bdv/ --max-line-length=120 --extend-ignore=E203,W503 --exclude=.git,__pycache__,.pytest_cache
+
+      - name: Style check — Mypy
+        run: mypy vbwd-backend/plugins/bdv/bdv/ --ignore-missing-imports --no-error-summary --python-version=3.11 || true
+
+      # The engine is pure, so the whole unit suite runs with no database and no
+      # peer plugins — that is the point of the purity oracle in this suite.
+      - name: Run unit tests
+        working-directory: vbwd-backend
+        run: python -m pytest plugins/bdv/tests/unit/ -v --tb=short
+
+  integration:
+    name: Integration — bdv
+    needs: ci
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Clone vbwd-backend
+        uses: actions/checkout@v4
+        with:
+          repository: VBWD-platform/vbwd-backend
+          ref: main
+          path: vbwd-backend
+
+      - name: Clone plugin
+        uses: actions/checkout@v4
+        with:
+          path: vbwd-backend/plugins/bdv
+
+      # bdv declares dependencies=["bot-base"] for the chat surface. Per-plugin
+      # CI isolation clones only the plugin under test, so without the peer the
+      # dependency gate leaves bdv disabled and `on_enable` never fires.
+      - name: Clone peer plugins (bot_base, meinchat)
+        run: |
+          git clone --depth=1 -q https://github.com/VBWD-platform/vbwd-plugin-bot-base.git \
+            vbwd-backend/plugins/bot_base || true
+          git clone --depth=1 -q https://github.com/VBWD-platform/vbwd-plugin-meinchat.git \
+            vbwd-backend/plugins/meinchat || true
+
+      # Keys MUST equal each plugin's PluginMetadata.name, not the repo suffix:
+      # the manager enables by metadata.name (`bot-base`, hyphenated).
+      - name: Create plugins.json (enable bdv + peers)
+        run: |
+          echo '{"plugins":{"bdv":{"enabled":true,"version":"26.7.0","source":"local"},"bot-base":{"enabled":true,"version":"26.6.1","source":"local"},"meinchat":{"enabled":true,"version":"26.6.1","source":"local"}}}' \
+            > vbwd-backend/plugins/plugins.json
+
+      - name: Start services
+        working-directory: vbwd-backend
+        run: docker compose up -d --build
+
+      - name: Wait for API
+        run: |
+          for i in $(seq 1 30); do
+            curl -sf http://localhost:5000/api/v1/health > /dev/null 2>&1 && break
+            sleep 2
+          done
+          curl -sf http://localhost:5000/api/v1/health || exit 1
+
+      # The plugin owns a root Alembic revision; heads must apply from cold.
+      - name: Apply migrations
+        working-directory: vbwd-backend
+        run: docker compose exec -T api alembic upgrade heads
+
+      - name: Run integration tests
+        working-directory: vbwd-backend
+        run: docker compose run --rm test pytest plugins/bdv/tests/integration/ -v --tb=short
+
+      - name: Cleanup
+        if: always()
+        working-directory: vbwd-backend
+        run: docker compose down -v

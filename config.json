@@ -1,0 +1,61 @@
+{
+  "debug_mode": {
+    "type": "boolean",
+    "default": false,
+    "description": "Enable verbose debug logging for the BizDevVibes plugin (live mode when off)"
+  },
+  "game_display_name": {
+    "type": "string",
+    "default": "BizDevVibes",
+    "description": "Public display name of the game. Config-driven so a rename stays a config change, not a refactor."
+  },
+  "turn_timeout_seconds": {
+    "type": "integer",
+    "default": 120,
+    "min": 15,
+    "max": 3600,
+    "description": "How long a seat has to act before the turn auto-takes the FREE sum (the 'fate default')."
+  },
+  "negotiation_window_seconds": {
+    "type": "integer",
+    "default": 30,
+    "min": 0,
+    "max": 300,
+    "description": "How long opponents may offer a bribe-to-fate before the mover must choose. 0 disables negotiation."
+  },
+  "agent_max_tokens_per_match": {
+    "type": "integer",
+    "default": 60000,
+    "min": 0,
+    "max": 2000000,
+    "description": "Per-match LLM token ceiling for an agent seat. Crossing it degrades the seat to the deterministic baseline agent."
+  },
+  "agent_max_repair_retries": {
+    "type": "integer",
+    "default": 2,
+    "min": 0,
+    "max": 5,
+    "description": "How many times an illegal LLM move is sent back for repair before the seat degrades to the baseline agent."
+  },
+  "min_seats": {
+    "type": "integer",
+    "default": 2,
+    "min": 2,
+    "max": 6,
+    "description": "Smallest table the lobby offers. Note the fee-to-opponents mechanic is near-meaningless at 2 seats."
+  },
+  "max_seats": {
+    "type": "integer",
+    "default": 4,
+    "min": 2,
+    "max": 6,
+    "description": "Largest table the lobby offers (the engine supports up to 6)."
+  },
+  "default_seats": {
+    "type": "integer",
+    "default": 3,
+    "min": 2,
+    "max": 6,
+    "description": "Default seat count for a new match. 3 is the smallest table where the redistribution mechanic is real."
+  }
+}

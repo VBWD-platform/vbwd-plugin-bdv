@@ -1,0 +1,16 @@
+{
+  "title": "BizDevVibes",
+  "description": "Dice-market board game. The sum is free; buying a single die is priced from the game state and the fee goes to your opponents.",
+  "icon": "grid",
+  "fields": [
+    { "key": "game_display_name", "label": "Game display name", "type": "text" },
+    { "key": "turn_timeout_seconds", "label": "Turn timeout (seconds)", "type": "number" },
+    { "key": "negotiation_window_seconds", "label": "Negotiation window (seconds)", "type": "number" },
+    { "key": "default_seats", "label": "Default seats", "type": "number" },
+    { "key": "min_seats", "label": "Minimum seats", "type": "number" },
+    { "key": "max_seats", "label": "Maximum seats", "type": "number" },
+    { "key": "agent_max_tokens_per_match", "label": "Agent token budget per match", "type": "number" },
+    { "key": "agent_max_repair_retries", "label": "Agent repair retries", "type": "number" },
+    { "key": "debug_mode", "label": "Debug mode", "type": "boolean" }
+  ]
+}

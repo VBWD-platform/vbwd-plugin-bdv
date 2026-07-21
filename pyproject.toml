@@ -1,0 +1,14 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "vbwd-plugin-bdv"
+version = "26.7.0"
+description = "BizDevVibes — a dice-market board game plugin for the vbwd platform"
+readme = "README.md"
+requires-python = ">=3.11"
+license = { file = "LICENSE" }
+
+[tool.setuptools]
+packages = ["bdv"]
