@@ -28,7 +28,10 @@ class MatchRepository(BaseRepository[BdvMatch]):
             .filter(BdvSeat.user_id == user_id)
             .distinct()
         )
-        total = statement.with_entities(func.count(func.distinct(BdvMatch.id))).scalar() or 0
+        total = (
+            statement.with_entities(func.count(func.distinct(BdvMatch.id))).scalar()
+            or 0
+        )
         rows = (
             statement.order_by(BdvMatch.created_at.desc())
             .limit(per_page)
@@ -71,7 +74,9 @@ class ActionRepository(BaseRepository[BdvAction]):
     def __init__(self, session):
         super().__init__(session, BdvAction)
 
-    def log(self, match_id, seq: int, seat_index: int, type_: str, payload, events) -> BdvAction:
+    def log(
+        self, match_id, seq: int, seat_index: int, type_: str, payload, events
+    ) -> BdvAction:
         row = BdvAction(
             match_id=match_id,
             seq=seq,

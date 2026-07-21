@@ -15,7 +15,9 @@ def roll_at(seed: str, cursor: int) -> Tuple[int, int]:
     return generator.randint(1, 6), generator.randint(1, 6)
 
 
-def shuffled_order(seed: str, deck: str, size: int, reshuffle: int = 0) -> Tuple[int, ...]:
+def shuffled_order(
+    seed: str, deck: str, size: int, reshuffle: int = 0
+) -> Tuple[int, ...]:
     """A deterministic draw order for a deck, reproducible from the seed alone."""
     if size <= 0:
         return ()

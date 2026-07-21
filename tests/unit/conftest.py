@@ -67,7 +67,13 @@ def worked_example_spec() -> BoardSpec:
             squares.append(service(37, "Analytics Stack"))
         elif index == 39:
             squares.append(
-                deal(39, "Enterprise Renewal", "expansion", 4000, (500, 900, 1800, 2700, 3500))
+                deal(
+                    39,
+                    "Enterprise Renewal",
+                    "expansion",
+                    4000,
+                    (500, 900, 1800, 2700, 3500),
+                )
             )
         else:
             squares.append(

@@ -151,7 +151,9 @@ class BoardSpec:
                 if not square.stage:
                     errors.append(
                         FieldError(
-                            field="stage", code="deal_requires_stage", index=square.index
+                            field="stage",
+                            code="deal_requires_stage",
+                            index=square.index,
                         )
                     )
                 if not square.rent_table:

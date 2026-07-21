@@ -56,16 +56,16 @@ def test_no_infrastructure_imports(module):
         if isinstance(node, ast.Import):
             for alias in node.names:
                 root = alias.name.split(".")[0]
-                assert root not in BANNED_IMPORT_ROOTS, (
-                    f"{module.name} imports {alias.name!r} — the engine must stay pure"
-                )
+                assert (
+                    root not in BANNED_IMPORT_ROOTS
+                ), f"{module.name} imports {alias.name!r} — the engine must stay pure"
         elif isinstance(node, ast.ImportFrom):
             if node.level:  # relative import inside core is fine
                 continue
             root = (node.module or "").split(".")[0]
-            assert root not in BANNED_IMPORT_ROOTS, (
-                f"{module.name} imports from {node.module!r} — the engine must stay pure"
-            )
+            assert (
+                root not in BANNED_IMPORT_ROOTS
+            ), f"{module.name} imports from {node.module!r} — the engine must stay pure"
 
 
 @pytest.mark.parametrize("module", core_modules(), ids=lambda p: p.name)
@@ -80,9 +80,9 @@ def test_no_module_level_randomness_or_clock(module):
         func = node.func
         if isinstance(func, ast.Attribute) and isinstance(func.value, ast.Name):
             pair = (func.value.id, func.attr)
-            assert pair not in BANNED_CALLS, (
-                f"{module.name} calls {pair[0]}.{pair[1]}() — non-reproducible"
-            )
+            assert (
+                pair not in BANNED_CALLS
+            ), f"{module.name} calls {pair[0]}.{pair[1]}() — non-reproducible"
 
 
 def test_engine_is_importable_without_an_app_context():

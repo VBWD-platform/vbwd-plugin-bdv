@@ -124,7 +124,11 @@ def _solvent_others(state: MatchState, seat_index: int) -> Tuple[int, ...]:
 
 
 def _move_to(
-    state: MatchState, spec: BoardSpec, seat_index: int, destination: int, collect_go: bool
+    state: MatchState,
+    spec: BoardSpec,
+    seat_index: int,
+    destination: int,
+    collect_go: bool,
 ) -> Tuple[MatchState, Tuple[Dict, ...]]:
     seat = state.seat(seat_index)
     passed_go = collect_go and destination < seat.position
@@ -315,14 +319,14 @@ class GoToJail:
 
     def apply(self, state, spec, ctx, params) -> EffectResult:
         jail_squares = spec.indices_of_kind(SquareKind.JAIL)
-        destination = jail_squares[0] if jail_squares else state.seat(ctx.seat_index).position
+        destination = (
+            jail_squares[0] if jail_squares else state.seat(ctx.seat_index).position
+        )
         seat = state.seat(ctx.seat_index)
         next_state = state.with_seat(
             replace(seat, position=destination, in_jail=True, jail_turns=0)
         )
-        return EffectResult(
-            next_state, ({"type": "jailed", "seat": ctx.seat_index},)
-        )
+        return EffectResult(next_state, ({"type": "jailed", "seat": ctx.seat_index},))
 
     def describe(self, params, spec) -> Description:
         return Description("bdv.effect.go_to_jail", {})
@@ -375,9 +379,12 @@ class AdvanceToNearestKind:
         if not candidates:
             raise CardExecutionError(f"board has no square of kind {kind.value}")
         distances = {
-            (index - seat.position) % spec.size: index for index in sorted(candidates, reverse=True)
+            (index - seat.position) % spec.size: index
+            for index in sorted(candidates, reverse=True)
         }
-        forward = min(d for d in distances if d > 0) if any(d > 0 for d in distances) else 0
+        forward = (
+            min(d for d in distances if d > 0) if any(d > 0 for d in distances) else 0
+        )
         destination = distances[forward]
         next_state, events = _move_to(state, spec, ctx.seat_index, destination, True)
         return EffectResult(next_state, events)

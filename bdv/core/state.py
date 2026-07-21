@@ -83,9 +83,7 @@ class MatchState:
         return self.houses.get(square_index, 0)
 
     def owned_by(self, seat_index: int) -> Tuple[int, ...]:
-        return tuple(
-            sorted(k for k, v in self.ownership.items() if v == seat_index)
-        )
+        return tuple(sorted(k for k, v in self.ownership.items() if v == seat_index))
 
     def has_constraint(self, kind: ConstraintKind, seat_index: int) -> bool:
         return any(
@@ -102,7 +100,9 @@ class MatchState:
         seat = self.seats[seat_index]
         return self.with_seat(replace(seat, cash=seat.cash + delta))
 
-    def with_ownership(self, square_index: int, seat_index: Optional[int]) -> "MatchState":
+    def with_ownership(
+        self, square_index: int, seat_index: Optional[int]
+    ) -> "MatchState":
         ownership = dict(self.ownership)
         ownership[square_index] = seat_index
         return replace(self, ownership=ownership)
@@ -227,9 +227,7 @@ class MatchState:
 def initial_state(seat_count: int, starting_cash: int) -> MatchState:
     """A fresh match: every seat identical, nothing owned."""
     return MatchState(
-        seats=tuple(
-            SeatState(index=i, cash=starting_cash) for i in range(seat_count)
-        ),
+        seats=tuple(SeatState(index=i, cash=starting_cash) for i in range(seat_count)),
         ownership={},
         houses={},
         deck_cursors={},

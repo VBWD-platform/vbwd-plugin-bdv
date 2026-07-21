@@ -115,7 +115,11 @@ class TestMatchLifecycle:
         from plugins.bdv.bdv.services.match_service import MatchError
 
         with pytest.raises(MatchError):
-            service.create(board, created_by=None, seats=[{"kind": "baseline", "display_name": "solo"}])
+            service.create(
+                board,
+                created_by=None,
+                seats=[{"kind": "baseline", "display_name": "solo"}],
+            )
 
 
 class TestActionLogIsTheSourceOfTruth:
@@ -132,9 +136,7 @@ class TestActionLogIsTheSourceOfTruth:
 
     def test_submit_appends_and_advances_the_sequence(self, db, board, service):
         match = self._match(board, service)
-        state, events = service.submit(
-            match, seat_index=0, action_type=ActionType.ROLL
-        )
+        state, events = service.submit(match, seat_index=0, action_type=ActionType.ROLL)
         assert state.pending_roll is not None
         assert match.state_seq == state.seq
         assert any(e["type"] == "rolled" for e in events)
@@ -146,9 +148,9 @@ class TestActionLogIsTheSourceOfTruth:
 
         snapshot = service.state_for(match)
         rebuilt = service.rebuild_state(match)
-        assert rebuilt.state_hash() == snapshot.state_hash(), (
-            "the cached snapshot must always equal the fold of the log"
-        )
+        assert (
+            rebuilt.state_hash() == snapshot.state_hash()
+        ), "the cached snapshot must always equal the fold of the log"
 
     def test_stale_state_seq_is_rejected(self, db, board, service):
         match = self._match(board, service)

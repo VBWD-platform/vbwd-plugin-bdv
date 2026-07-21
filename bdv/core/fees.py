@@ -25,9 +25,7 @@ class FeeDistributionPolicy(Protocol):
 
 def _eligible_recipients(state: MatchState, payer: int) -> Tuple[int, ...]:
     return tuple(
-        seat.index
-        for seat in state.seats
-        if seat.index != payer and not seat.bankrupt
+        seat.index for seat in state.seats if seat.index != payer and not seat.bankrupt
     )
 
 

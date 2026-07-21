@@ -59,7 +59,11 @@ def rent_due(
         if not table:
             return 0
         base = table[min(houses, len(table) - 1)]
-        if houses == 0 and square.stage and _owns_whole_stage(state, spec, square, owner):
+        if (
+            houses == 0
+            and square.stage
+            and _owns_whole_stage(state, spec, square, owner)
+        ):
             return base * 2
         return base
 
@@ -94,9 +98,7 @@ def _would_complete_stage(
         return False
     members = spec.stage_members(square.stage)
     others = [index for index in members if index != square.index]
-    return bool(others) and all(
-        state.owner_of(index) == seat_index for index in others
-    )
+    return bool(others) and all(state.owner_of(index) == seat_index for index in others)
 
 
 def evaluate_square(
@@ -131,7 +133,11 @@ def evaluate_square(
         return -rent, "pays_rent", {"name": square.name, "rent": rent}
 
     if square.kind == SquareKind.TAX:
-        return -square.tax_amount, "tax", {"name": square.name, "amount": square.tax_amount}
+        return (
+            -square.tax_amount,
+            "tax",
+            {"name": square.name, "amount": square.tax_amount},
+        )
 
     if square.kind == SquareKind.GO:
         return spec.go_salary, "go", {"name": square.name}
@@ -152,7 +158,9 @@ def evaluate_square(
     return 0, "neutral", {"name": square.name}
 
 
-def target_index(state: MatchState, spec: BoardSpec, seat_index: int, steps: int) -> int:
+def target_index(
+    state: MatchState, spec: BoardSpec, seat_index: int, steps: int
+) -> int:
     return (state.seat(seat_index).position + steps) % spec.size
 
 

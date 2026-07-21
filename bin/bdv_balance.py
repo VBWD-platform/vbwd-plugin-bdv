@@ -40,7 +40,9 @@ from plugins.bdv.bdv.services.seed_board import (  # noqa: E402
 )
 
 
-def build_spec(fee_policy: str, k_price: str = "0.5", cap_pct: str = "0.30") -> BoardSpec:
+def build_spec(
+    fee_policy: str, k_price: str = "0.5", cap_pct: str = "0.30"
+) -> BoardSpec:
     payload = seed_board_payload()
     squares = tuple(
         SquareSpec(
@@ -83,7 +85,9 @@ def gini(values: List[int]) -> float:
     return (2 * weighted) / (n * total) - (n + 1) / n
 
 
-def run_match(spec: BoardSpec, seed: str, seat_count: int, max_actions: int = 6000) -> Dict:
+def run_match(
+    spec: BoardSpec, seed: str, seat_count: int, max_actions: int = 6000
+) -> Dict:
     agent = BaselineSeat()
     config = MatchConfig(seed=seed, seat_count=seat_count)
     state = new_match(spec, config)
@@ -186,7 +190,9 @@ def main() -> int:
         print(json.dumps(arms, indent=2))
         return 0
 
-    print(f"\nBizDevVibes balance harness — {args.matches} matches/arm, {args.seats} seats\n")
+    print(
+        f"\nBizDevVibes balance harness — {args.matches} matches/arm, {args.seats} seats\n"
+    )
     header = (
         f"{'fee policy':<24}{'gini start':>11}{'gini mid':>10}{'gini end':>10}"
         f"{'peak':>8}{'turns':>8}{'buys':>7}{'capped':>8}{'leadΔ':>7}"

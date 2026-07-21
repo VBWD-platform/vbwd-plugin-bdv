@@ -315,14 +315,20 @@ def _spec_from_payload(payload: Dict) -> BoardSpec:
     )
 
     def deck_hint(deck: str) -> int:
-        cards = [c for c in payload.get("cards", []) if c["deck"] == deck and c.get("is_active", True)]
+        cards = [
+            c
+            for c in payload.get("cards", [])
+            if c["deck"] == deck and c.get("is_active", True)
+        ]
         if not cards:
             return 0
         weight_total = sum(max(1, c.get("weight", 1)) for c in cards)
         weighted = 0
         for card in cards:
             try:
-                weighted += effect_ev_hint(card["effect"], spec) * max(1, card.get("weight", 1))
+                weighted += effect_ev_hint(card["effect"], spec) * max(
+                    1, card.get("weight", 1)
+                )
             except Exception:
                 continue
         return int(round(weighted / weight_total)) if weight_total else 0

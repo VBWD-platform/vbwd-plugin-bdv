@@ -37,8 +37,12 @@ class TestDeterministicDice:
         assert sorted(first) == list(range(12))
 
     def test_reshuffle_changes_the_order_deterministically(self):
-        assert shuffled_order("s", "chance", 12, 0) != shuffled_order("s", "chance", 12, 1)
-        assert shuffled_order("s", "chance", 12, 1) == shuffled_order("s", "chance", 12, 1)
+        assert shuffled_order("s", "chance", 12, 0) != shuffled_order(
+            "s", "chance", 12, 1
+        )
+        assert shuffled_order("s", "chance", 12, 1) == shuffled_order(
+            "s", "chance", 12, 1
+        )
 
 
 class TestFullMatchReplay:
@@ -134,7 +138,9 @@ class TestFoldRebuildsSnapshots:
             action = agent.next_action(state, tiny_spec, state.turn_seat)
             state = apply(state, tiny_spec, config, action).state
             log.append(action)
-            assert fold(tiny_spec, config, tuple(log)).state_hash() == state.state_hash()
+            assert (
+                fold(tiny_spec, config, tuple(log)).state_hash() == state.state_hash()
+            )
 
 
 class TestStateSerialisation:

@@ -70,8 +70,12 @@ class BoardSpecFactory:
         weighted = 0
         for card in cards:
             try:
-                weighted += effect_ev_hint(card.effect or {}, spec) * max(1, card.weight or 1)
-            except Exception:  # a broken card contributes 0 rather than exploding a quote
+                weighted += effect_ev_hint(card.effect or {}, spec) * max(
+                    1, card.weight or 1
+                )
+            except (
+                Exception
+            ):  # a broken card contributes 0 rather than exploding a quote
                 continue
         return int(round(weighted / total_weight)) if total_weight else 0
 
@@ -79,7 +83,9 @@ class BoardSpecFactory:
     def cards_for(board, deck: str) -> List:
         return [
             card
-            for card in sorted(board.cards or [], key=lambda c: (c.sort_order, str(c.id)))
+            for card in sorted(
+                board.cards or [], key=lambda c: (c.sort_order, str(c.id))
+            )
             if card.deck == deck and card.is_active
         ]
 
@@ -100,7 +106,10 @@ class BoardSpecFactory:
                         "params": {"card": card.title, "message": message},
                     }
                 )
-        if board.default_seats < board.min_seats or board.default_seats > board.max_seats:
+        if (
+            board.default_seats < board.min_seats
+            or board.default_seats > board.max_seats
+        ):
             errors.append(
                 {
                     "field": "default_seats",

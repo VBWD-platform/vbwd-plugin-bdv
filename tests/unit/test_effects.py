@@ -46,7 +46,10 @@ class TestRegistry:
 
 class TestValidation:
     def test_valid_effect_has_no_errors(self):
-        assert validate_effect({"ops": [{"op": "pay_bank", "params": {"amount": 100}}]}) == []
+        assert (
+            validate_effect({"ops": [{"op": "pay_bank", "params": {"amount": 100}}]})
+            == []
+        )
 
     def test_empty_ops_is_rejected(self):
         assert validate_effect({"ops": []})
@@ -60,13 +63,19 @@ class TestValidation:
 class TestMoneyOps:
     def test_pay_bank(self, tiny_state, tiny_spec):
         result = apply_effect(
-            tiny_state, tiny_spec, 0, {"ops": [{"op": "pay_bank", "params": {"amount": 150}}]}
+            tiny_state,
+            tiny_spec,
+            0,
+            {"ops": [{"op": "pay_bank", "params": {"amount": 150}}]},
         )
         assert result.state.seat(0).cash == 1850
 
     def test_collect_bank(self, tiny_state, tiny_spec):
         result = apply_effect(
-            tiny_state, tiny_spec, 0, {"ops": [{"op": "collect_bank", "params": {"amount": 150}}]}
+            tiny_state,
+            tiny_spec,
+            0,
+            {"ops": [{"op": "collect_bank", "params": {"amount": 150}}]},
         )
         assert result.state.seat(0).cash == 2150
 
@@ -141,7 +150,10 @@ class TestMovementOps:
     def test_move_relative_wraps(self, tiny_state, tiny_spec):
         state = tiny_state.with_seat(SeatState(index=0, cash=2000, position=1))
         result = apply_effect(
-            state, tiny_spec, 0, {"ops": [{"op": "move_relative", "params": {"steps": -3}}]}
+            state,
+            tiny_spec,
+            0,
+            {"ops": [{"op": "move_relative", "params": {"steps": -3}}]},
         )
         assert result.state.seat(0).position == 8
 
@@ -180,7 +192,14 @@ class TestHeldAndStatefulOps:
             state,
             tiny_spec,
             0,
-            {"ops": [{"op": "pay_per_building", "params": {"per_house": 25, "per_hotel": 100}}]},
+            {
+                "ops": [
+                    {
+                        "op": "pay_per_building",
+                        "params": {"per_house": 25, "per_hotel": 100},
+                    }
+                ]
+            },
         )
         assert result.state.seat(0).cash == 2000 - 75
 
@@ -226,8 +245,16 @@ class TestGeneratedDescriptions:
     behaviour. These are the golden strings that keep admin-visible prose honest."""
 
     GOLDEN = [
-        ({"op": "pay_bank", "params": {"amount": 150}}, "bdv.effect.pay_bank", {"amount": 150}),
-        ({"op": "collect_bank", "params": {"amount": 200}}, "bdv.effect.collect_bank", {"amount": 200}),
+        (
+            {"op": "pay_bank", "params": {"amount": 150}},
+            "bdv.effect.pay_bank",
+            {"amount": 150},
+        ),
+        (
+            {"op": "collect_bank", "params": {"amount": 200}},
+            "bdv.effect.collect_bank",
+            {"amount": 200},
+        ),
         (
             {"op": "collect_from_each_player", "params": {"amount": 100}},
             "bdv.effect.collect_from_each_player",
@@ -272,8 +299,18 @@ class TestGeneratedDescriptions:
 
 class TestEvHints:
     def test_signs_are_right(self, tiny_spec):
-        assert effect_ev_hint({"ops": [{"op": "pay_bank", "params": {"amount": 100}}]}, tiny_spec) == -100
-        assert effect_ev_hint({"ops": [{"op": "collect_bank", "params": {"amount": 100}}]}, tiny_spec) == 100
+        assert (
+            effect_ev_hint(
+                {"ops": [{"op": "pay_bank", "params": {"amount": 100}}]}, tiny_spec
+            )
+            == -100
+        )
+        assert (
+            effect_ev_hint(
+                {"ops": [{"op": "collect_bank", "params": {"amount": 100}}]}, tiny_spec
+            )
+            == 100
+        )
 
     def test_hints_compose_across_ops(self, tiny_spec):
         effect = {

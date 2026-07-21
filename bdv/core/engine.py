@@ -165,11 +165,7 @@ def _handle_accept_bribe(state, spec, config, action) -> ApplyResult:
     next_state = replace(
         next_state,
         constraints=next_state.constraints
-        + (
-            Constraint(
-                kind=ConstraintKind.FORCED_SUM, seat_index=action.seat_index
-            ),
-        ),
+        + (Constraint(kind=ConstraintKind.FORCED_SUM, seat_index=action.seat_index),),
         phase=Phase.AWAIT_CHOICE,
     ).bump()
     return ApplyResult(
@@ -244,7 +240,9 @@ def _handle_choose_option(state, spec, config, action) -> ApplyResult:
             }
         )
 
-    working, move_events = _move_and_resolve(working, spec, config, action.seat_index, steps)
+    working, move_events = _move_and_resolve(
+        working, spec, config, action.seat_index, steps
+    )
     events.extend(move_events)
 
     if working.phase == Phase.FINISHED:
@@ -299,7 +297,9 @@ def _move_and_resolve(
         events.append({"type": "jailed", "seat": seat_index})
 
     elif square.kind in (SquareKind.CHANCE, SquareKind.COMMUNITY):
-        working, draw_events = _draw_card(working, spec, config, seat_index, square.kind)
+        working, draw_events = _draw_card(
+            working, spec, config, seat_index, square.kind
+        )
         events.extend(draw_events)
 
     elif square.is_ownable:
@@ -413,7 +413,8 @@ def _handle_decline_purchase(state, spec, config, action) -> ApplyResult:
 def _handle_end_turn(state, spec, config, action) -> ApplyResult:
     _require_turn(state, action.seat_index)
     return ApplyResult(
-        _advance_turn(state, spec).bump(), ({"type": "turn_ended", "seat": action.seat_index},)
+        _advance_turn(state, spec).bump(),
+        ({"type": "turn_ended", "seat": action.seat_index},),
     )
 
 
@@ -428,7 +429,9 @@ def _handle_declare_bankrupt(state, spec, config, action) -> ApplyResult:
     )
 
 
-def _settle_bankruptcy(state: MatchState, seat_index: int) -> Tuple[MatchState, List[Dict]]:
+def _settle_bankruptcy(
+    state: MatchState, seat_index: int
+) -> Tuple[MatchState, List[Dict]]:
     seat = state.seat(seat_index)
     if seat.bankrupt or seat.cash >= 0:
         return state, []
@@ -496,9 +499,7 @@ def apply(
     return handler(state, spec, config, action)
 
 
-def options_for(
-    state: MatchState, spec: BoardSpec, seat_index: Optional[int] = None
-):
+def options_for(state: MatchState, spec: BoardSpec, seat_index: Optional[int] = None):
     """Priced options for the pending roll, or () when none is pending."""
     if state.pending_roll is None:
         return ()

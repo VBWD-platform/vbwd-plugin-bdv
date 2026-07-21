@@ -53,7 +53,9 @@ class TestWorkedExample:
         assert quotes[3].price == 450, "0.5 x (0 - (-900)) — dodging is expensive"
         assert quotes[5].price == 0, "fate is always free"
 
-    def test_the_sum_is_flagged_and_free(self, worked_example_state, worked_example_spec):
+    def test_the_sum_is_flagged_and_free(
+        self, worked_example_state, worked_example_spec
+    ):
         quotes = evaluate_options(worked_example_state, worked_example_spec, (2, 3))
         sums = [q for q in quotes if q.is_sum]
         assert len(sums) == 1 and sums[0].steps == 5 and sums[0].price == 0
@@ -87,9 +89,7 @@ class TestAffordabilityCap:
     def test_rich_mover_can_afford_the_dodge(
         self, worked_example_state, worked_example_spec
     ):
-        quote = quote_for_steps(
-            worked_example_state, worked_example_spec, (2, 3), 2
-        )
+        quote = quote_for_steps(worked_example_state, worked_example_spec, (2, 3), 2)
         assert quote.price == 600 and quote.affordable is True
 
     def test_poor_mover_sees_the_price_but_cannot_pay(

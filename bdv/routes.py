@@ -242,7 +242,15 @@ def replace_squares(board_id):
     _boards().replace_squares(board, rows)
     errors = BoardSpecFactory.validate(board)
     db.session.commit()
-    return jsonify({"squares": [s.to_dict() for s in board.squares], "validation_errors": errors}), 200
+    return (
+        jsonify(
+            {
+                "squares": [s.to_dict() for s in board.squares],
+                "validation_errors": errors,
+            }
+        ),
+        200,
+    )
 
 
 @bdv_bp.route(f"{ADMIN}/boards/bulk/<operation>", methods=["POST"])
@@ -390,7 +398,15 @@ def modify_card(card_id):
         problems = validate_effect(data["effect"])
         if problems:
             return jsonify({"error": "invalid effect", "errors": problems}), 422
-    for field in ("deck", "title", "flavor_text", "effect", "weight", "is_active", "sort_order"):
+    for field in (
+        "deck",
+        "title",
+        "flavor_text",
+        "effect",
+        "weight",
+        "is_active",
+        "sort_order",
+    ):
         if field in data:
             setattr(card, field, data[field])
     db.session.commit()
@@ -469,7 +485,9 @@ def create_match():
         kind = opponent.get("kind", SEAT_KIND_BASELINE)
         seats.append(
             {
-                "kind": kind if kind in {SEAT_KIND_LLM, SEAT_KIND_BASELINE} else SEAT_KIND_BASELINE,
+                "kind": kind
+                if kind in {SEAT_KIND_LLM, SEAT_KIND_BASELINE}
+                else SEAT_KIND_BASELINE,
                 "agent_profile_id": opponent.get("agent_profile_id"),
                 "display_name": opponent.get("display_name") or "Agent",
             }
@@ -586,7 +604,10 @@ def submit_action(match_id):
         return jsonify({"error": str(rejected)}), 422
 
     db.session.commit()
-    return jsonify({"state_seq": state.seq, "state": state.to_dict(), "events": events}), 200
+    return (
+        jsonify({"state_seq": state.seq, "state": state.to_dict(), "events": events}),
+        200,
+    )
 
 
 @bdv_bp.route(f"{PLAY}/matches/<match_id>/events", methods=["GET"])
@@ -626,7 +647,10 @@ def match_offers(match_id):
 
     offers = OfferRepository(db.session)
     if request.method == "GET":
-        return jsonify({"items": [o.to_dict() for o in offers.open_for_match(match.id)]}), 200
+        return (
+            jsonify({"items": [o.to_dict() for o in offers.open_for_match(match.id)]}),
+            200,
+        )
 
     data = request.get_json(silent=True) or {}
     try:

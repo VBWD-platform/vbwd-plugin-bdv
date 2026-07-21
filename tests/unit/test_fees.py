@@ -44,7 +44,11 @@ class TestAllToPoorest:
 
     def test_bankrupt_seats_are_not_recipients(self):
         policy = resolve_fee_policy("all_to_poorest")
-        payout = policy.distribute(300, state_with(9000, 100, 4000), payer=0, )
+        payout = policy.distribute(
+            300,
+            state_with(9000, 100, 4000),
+            payer=0,
+        )
         assert payout == {1: 300}
         payout = policy.distribute(
             300, state_with(9000, 100, 4000, bankrupt=(1,)), payer=0

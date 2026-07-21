@@ -10,9 +10,7 @@ from .seed_board import SEED_BOARD_SLUG, seed_board_payload, seed_cards, seed_sq
 
 
 def seed_funnel_board(session) -> Tuple[BdvBoard, bool]:
-    existing = (
-        session.query(BdvBoard).filter(BdvBoard.slug == SEED_BOARD_SLUG).first()
-    )
+    existing = session.query(BdvBoard).filter(BdvBoard.slug == SEED_BOARD_SLUG).first()
     if existing is not None:
         return existing, False
 

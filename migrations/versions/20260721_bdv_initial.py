@@ -28,30 +28,48 @@ def upgrade():
         sa.Column("name", sa.String(length=120), nullable=False),
         sa.Column("slug", sa.String(length=140), nullable=False),
         sa.Column("description", sa.Text(), nullable=True),
-        sa.Column("status", sa.String(length=20), nullable=False, server_default="draft"),
+        sa.Column(
+            "status", sa.String(length=20), nullable=False, server_default="draft"
+        ),
         sa.Column(
             "game_display_name",
             sa.String(length=120),
             nullable=False,
             server_default="BizDevVibes",
         ),
-        sa.Column("currency_label", sa.String(length=20), nullable=False, server_default="cr"),
-        sa.Column("starting_cash", sa.Integer(), nullable=False, server_default="15000"),
+        sa.Column(
+            "currency_label", sa.String(length=20), nullable=False, server_default="cr"
+        ),
+        sa.Column(
+            "starting_cash", sa.Integer(), nullable=False, server_default="15000"
+        ),
         sa.Column("go_salary", sa.Integer(), nullable=False, server_default="2000"),
         sa.Column("jail_fine", sa.Integer(), nullable=False, server_default="500"),
-        sa.Column("jail_penalty_ev", sa.Integer(), nullable=False, server_default="1000"),
+        sa.Column(
+            "jail_penalty_ev", sa.Integer(), nullable=False, server_default="1000"
+        ),
         sa.Column("k_price", sa.Numeric(6, 4), nullable=False, server_default="0.5000"),
-        sa.Column("k_acquire", sa.Numeric(6, 4), nullable=False, server_default="0.3000"),
+        sa.Column(
+            "k_acquire", sa.Numeric(6, 4), nullable=False, server_default="0.3000"
+        ),
         sa.Column("cap_pct", sa.Numeric(6, 4), nullable=False, server_default="0.3000"),
         sa.Column(
-            "fee_policy", sa.String(length=40), nullable=False, server_default="all_to_poorest"
+            "fee_policy",
+            sa.String(length=40),
+            nullable=False,
+            server_default="all_to_poorest",
         ),
         sa.Column("min_seats", sa.Integer(), nullable=False, server_default="2"),
         sa.Column("max_seats", sa.Integer(), nullable=False, server_default="6"),
         sa.Column("default_seats", sa.Integer(), nullable=False, server_default="3"),
-        sa.Column("turn_timeout_seconds", sa.Integer(), nullable=False, server_default="120"),
         sa.Column(
-            "negotiation_window_seconds", sa.Integer(), nullable=False, server_default="30"
+            "turn_timeout_seconds", sa.Integer(), nullable=False, server_default="120"
+        ),
+        sa.Column(
+            "negotiation_window_seconds",
+            sa.Integer(),
+            nullable=False,
+            server_default="30",
         ),
         sa.Column("max_houses", sa.Integer(), nullable=False, server_default="5"),
         sa.UniqueConstraint("slug", name="uq_bdv_board_slug"),
@@ -111,7 +129,9 @@ def upgrade():
         sa.Column("llm_connection_id", postgresql.UUID(as_uuid=True), nullable=True),
         sa.Column("persona", sa.String(length=200), nullable=True),
         sa.Column("system_prompt", sa.Text(), nullable=True),
-        sa.Column("temperature", sa.Numeric(4, 2), nullable=False, server_default="0.70"),
+        sa.Column(
+            "temperature", sa.Numeric(4, 2), nullable=False, server_default="0.70"
+        ),
         sa.Column(
             "max_tokens_per_match", sa.Integer(), nullable=False, server_default="60000"
         ),
@@ -127,14 +147,18 @@ def upgrade():
         sa.Column("updated_at", sa.DateTime(timezone=True), nullable=True),
         sa.Column("version", sa.Integer(), nullable=True),
         sa.Column("board_id", postgresql.UUID(as_uuid=True), nullable=False),
-        sa.Column("status", sa.String(length=20), nullable=False, server_default="lobby"),
+        sa.Column(
+            "status", sa.String(length=20), nullable=False, server_default="lobby"
+        ),
         sa.Column("seed", sa.String(length=64), nullable=False),
         sa.Column("spec_snapshot", sa.JSON(), nullable=False),
         sa.Column("spec_hash", sa.String(length=64), nullable=False),
         sa.Column("state_snapshot", sa.JSON(), nullable=True),
         sa.Column("state_seq", sa.Integer(), nullable=False, server_default="0"),
         sa.Column("chance_deck_size", sa.Integer(), nullable=False, server_default="0"),
-        sa.Column("community_deck_size", sa.Integer(), nullable=False, server_default="0"),
+        sa.Column(
+            "community_deck_size", sa.Integer(), nullable=False, server_default="0"
+        ),
         sa.Column("created_by", postgresql.UUID(as_uuid=True), nullable=True),
         sa.Column("chat_room_id", postgresql.UUID(as_uuid=True), nullable=True),
         sa.Column("winner_seat_index", sa.Integer(), nullable=True),
@@ -200,11 +224,15 @@ def upgrade():
         sa.Column("version", sa.Integer(), nullable=True),
         sa.Column("match_id", postgresql.UUID(as_uuid=True), nullable=False),
         sa.Column("turn_seq", sa.Integer(), nullable=False),
-        sa.Column("kind", sa.String(length=30), nullable=False, server_default="bribe_to_fate"),
+        sa.Column(
+            "kind", sa.String(length=30), nullable=False, server_default="bribe_to_fate"
+        ),
         sa.Column("from_seat", sa.Integer(), nullable=False),
         sa.Column("to_seat", sa.Integer(), nullable=False),
         sa.Column("amount", sa.Integer(), nullable=False),
-        sa.Column("status", sa.String(length=20), nullable=False, server_default="open"),
+        sa.Column(
+            "status", sa.String(length=20), nullable=False, server_default="open"
+        ),
         sa.Column("expires_at", sa.DateTime(timezone=True), nullable=True),
         sa.ForeignKeyConstraint(["match_id"], ["bdv_match.id"], ondelete="CASCADE"),
     )

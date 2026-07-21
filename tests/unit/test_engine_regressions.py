@@ -89,9 +89,9 @@ class TestMatchEndIsNeverOverwritten:
         result = apply(
             state, tiny_spec, config, Action(ActionType.CHOOSE_OPTION, 0, {"steps": 3})
         )
-        assert result.state.phase == Phase.FINISHED, (
-            "phase=RESOLVING must never clobber a finished match"
-        )
+        assert (
+            result.state.phase == Phase.FINISHED
+        ), "phase=RESOLVING must never clobber a finished match"
         assert result.state.winner_seat == 1
         assert any(e["type"] == "match_finished" for e in result.events)
 

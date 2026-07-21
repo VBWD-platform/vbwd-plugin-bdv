@@ -80,7 +80,10 @@ class TestChoosingAnOption:
         fate = sum(state.pending_roll)
         before = state.seat(0).cash
         result = apply(
-            state, tiny_spec, config, Action(ActionType.CHOOSE_OPTION, 0, {"steps": fate})
+            state,
+            tiny_spec,
+            config,
+            Action(ActionType.CHOOSE_OPTION, 0, {"steps": fate}),
         )
         purchase_events = [e for e in result.events if e["type"] == "option_purchased"]
         assert not purchase_events
@@ -145,9 +148,9 @@ class TestFeeFlowEndToEnd:
         assert after.seat(0).cash == 10000 - 600, "mover paid 600"
         assert after.seat(2).cash == 3000 + 600, "poorest received all of it"
         assert after.seat(1).cash == 8000, "the middle seat is untouched"
-        assert sum(s.cash for s in after.seats) == total_before, (
-            "the fee is a TRANSFER — the bank creates and destroys nothing"
-        )
+        assert (
+            sum(s.cash for s in after.seats) == total_before
+        ), "the fee is a TRANSFER — the bank creates and destroys nothing"
 
     def test_split_policy_divides_between_opponents(self, worked_example_spec):
         spec = dataclasses.replace(
@@ -193,7 +196,9 @@ class TestBribeToFate:
         )
         return state
 
-    def test_accepting_transfers_the_money_and_binds_the_turn(self, worked_example_spec):
+    def test_accepting_transfers_the_money_and_binds_the_turn(
+        self, worked_example_spec
+    ):
         cfg = MatchConfig(seed="s", seat_count=3)
         state = self._negotiating(worked_example_spec, cfg)
         result = apply(
@@ -296,7 +301,9 @@ class TestBribeToFate:
             cfg,
             Action(ActionType.CHOOSE_OPTION, 0, {"steps": 5}),
         ).state
-        state = apply(state, worked_example_spec, cfg, Action(ActionType.END_TURN, 0)).state
+        state = apply(
+            state, worked_example_spec, cfg, Action(ActionType.END_TURN, 0)
+        ).state
         assert state.constraints == ()
         assert state.turn_seat == 1
 
@@ -342,7 +349,9 @@ class TestPropertyAndRent:
 class TestTaxJailAndSalary:
     def test_tax_square_charges_the_board_amount(self, tiny_spec, config):
         state = new_match(tiny_spec, config)
-        state = dataclasses.replace(state, pending_roll=(2, 2), phase=Phase.AWAIT_CHOICE)
+        state = dataclasses.replace(
+            state, pending_roll=(2, 2), phase=Phase.AWAIT_CHOICE
+        )
         result = apply(
             state, tiny_spec, config, Action(ActionType.CHOOSE_OPTION, 0, {"steps": 4})
         )
@@ -399,8 +408,12 @@ class TestBankruptcyAndMatchEnd:
 
     def test_no_actions_accepted_after_the_match_ends(self, tiny_spec, config):
         state = new_match(tiny_spec, config)
-        state = apply(state, tiny_spec, config, Action(ActionType.DECLARE_BANKRUPT, 0)).state
-        state = apply(state, tiny_spec, config, Action(ActionType.DECLARE_BANKRUPT, 1)).state
+        state = apply(
+            state, tiny_spec, config, Action(ActionType.DECLARE_BANKRUPT, 0)
+        ).state
+        state = apply(
+            state, tiny_spec, config, Action(ActionType.DECLARE_BANKRUPT, 1)
+        ).state
         with pytest.raises(IllegalActionError):
             apply(state, tiny_spec, config, Action(ActionType.ROLL, 2))
 

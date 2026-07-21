@@ -112,9 +112,7 @@ class TestLayout:
     def test_stage_sizes_are_2_3_3_3_3_3_3_2(self):
         from collections import Counter
 
-        counts = Counter(
-            s["stage"] for s in seed_squares() if s["kind"] == "deal"
-        )
+        counts = Counter(s["stage"] for s in seed_squares() if s["kind"] == "deal")
         assert sorted(counts.values()) == [2, 2, 3, 3, 3, 3, 3, 3]
 
     def test_corners_are_at_the_corners(self):

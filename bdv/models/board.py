@@ -22,7 +22,9 @@ class BdvBoard(BaseModel):
     status = db.Column(
         db.String(20), nullable=False, server_default=BOARD_STATUS_DRAFT, index=True
     )
-    game_display_name = db.Column(db.String(120), nullable=False, server_default="BizDevVibes")
+    game_display_name = db.Column(
+        db.String(120), nullable=False, server_default="BizDevVibes"
+    )
     currency_label = db.Column(db.String(20), nullable=False, server_default="cr")
 
     starting_cash = db.Column(db.Integer, nullable=False, server_default="15000")
@@ -35,13 +37,17 @@ class BdvBoard(BaseModel):
     k_price = db.Column(db.Numeric(6, 4), nullable=False, server_default="0.5000")
     k_acquire = db.Column(db.Numeric(6, 4), nullable=False, server_default="0.3000")
     cap_pct = db.Column(db.Numeric(6, 4), nullable=False, server_default="0.3000")
-    fee_policy = db.Column(db.String(40), nullable=False, server_default="all_to_poorest")
+    fee_policy = db.Column(
+        db.String(40), nullable=False, server_default="all_to_poorest"
+    )
 
     min_seats = db.Column(db.Integer, nullable=False, server_default="2")
     max_seats = db.Column(db.Integer, nullable=False, server_default="6")
     default_seats = db.Column(db.Integer, nullable=False, server_default="3")
     turn_timeout_seconds = db.Column(db.Integer, nullable=False, server_default="120")
-    negotiation_window_seconds = db.Column(db.Integer, nullable=False, server_default="30")
+    negotiation_window_seconds = db.Column(
+        db.Integer, nullable=False, server_default="30"
+    )
     max_houses = db.Column(db.Integer, nullable=False, server_default="5")
 
     squares = db.relationship(
