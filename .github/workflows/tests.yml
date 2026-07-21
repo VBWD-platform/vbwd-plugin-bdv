@@ -72,21 +72,26 @@ jobs:
         with:
           path: vbwd-backend/plugins/bdv
 
-      # bdv declares dependencies=["bot-base"] for the chat surface. Per-plugin
-      # CI isolation clones only the plugin under test, so without the peer the
-      # dependency gate leaves bdv disabled and `on_enable` never fires.
-      - name: Clone peer plugins (bot_base, meinchat)
+      # bdv declares dependencies=["bot-base"], so the peer must be present or
+      # the dependency gate leaves bdv disabled and `on_enable` never fires.
+      #
+      # ONLY bot_base. `meinchat` is deliberately NOT cloned: its migrations are
+      # anchored on a `subscription` revision, so its mere presence makes alembic
+      # fail building the revision map (KeyError: 20260523_1000_sub_baseline)
+      # unless the whole chain is cloned too. bdv does not import meinchat — the
+      # chat surface rides bot-base's provider-neutral seam — so pulling it in
+      # would buy nothing and drag in three more repos.
+      # bot_base itself anchors on the core revision `vbwd_001`, so it is safe.
+      - name: Clone peer plugin (bot_base)
         run: |
           git clone --depth=1 -q https://github.com/VBWD-platform/vbwd-plugin-bot-base.git \
-            vbwd-backend/plugins/bot_base || true
-          git clone --depth=1 -q https://github.com/VBWD-platform/vbwd-plugin-meinchat.git \
-            vbwd-backend/plugins/meinchat || true
+            vbwd-backend/plugins/bot_base
 
       # Keys MUST equal each plugin's PluginMetadata.name, not the repo suffix:
       # the manager enables by metadata.name (`bot-base`, hyphenated).
-      - name: Create plugins.json (enable bdv + peers)
+      - name: Create plugins.json (enable bdv + bot-base)
         run: |
-          echo '{"plugins":{"bdv":{"enabled":true,"version":"26.7.0","source":"local"},"bot-base":{"enabled":true,"version":"26.6.1","source":"local"},"meinchat":{"enabled":true,"version":"26.6.1","source":"local"}}}' \
+          echo '{"plugins":{"bdv":{"enabled":true,"version":"26.7.0","source":"local"},"bot-base":{"enabled":true,"version":"26.6.1","source":"local"}}}' \
             > vbwd-backend/plugins/plugins.json
 
       - name: Start services
