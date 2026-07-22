@@ -1,14 +1,40 @@
 [build-system]
-requires = ["setuptools>=68", "wheel"]
+requires = ["setuptools>=68.0", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
 name = "vbwd-plugin-bdv"
 version = "26.7.0"
-description = "BizDevVibes — a dice-market board game plugin for the vbwd platform"
+description = "VBWD backend plugin: bdv (BizDevVibes) — dice-market board game"
 readme = "README.md"
 requires-python = ">=3.11"
-license = { file = "LICENSE" }
+license = { text = "BSL-1.1" }
+# No third-party runtime dependencies: the engine is pure standard-library
+# Python, and Flask / SQLAlchemy / Alembic come from the vbwd-backend host.
+dependencies = []
 
 [tool.setuptools]
-packages = ["bdv"]
+# The repo root IS the plugins/bdv/ directory; remap it so the wheel exposes the
+# `plugins.bdv` package that runtime imports expect. A plain `packages = ["bdv"]`
+# would install a TOP-LEVEL `bdv`, which the plugin manager could never find.
+package-dir = { "plugins.bdv" = "." }
+packages = [
+    "plugins.bdv",
+    "plugins.bdv.bdv",
+    "plugins.bdv.bdv.core",
+    "plugins.bdv.bdv.models",
+    "plugins.bdv.bdv.repositories",
+    "plugins.bdv.bdv.services",
+    "plugins.bdv.bdv.agents",
+    "plugins.bdv.bdv.bot",
+]
+
+[tool.setuptools.package-data]
+# Ship everything a pip-installed plugin needs to be self-complete: the config
+# JSON and the Alembic migrations (the shared backend env.py resolves
+# version_locations from the installed package path).
+"plugins.bdv" = [
+    "*.json",
+    "migrations/*.py",
+    "migrations/**/*.py",
+]
