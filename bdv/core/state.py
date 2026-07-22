@@ -17,6 +17,8 @@ class Phase(str, Enum):
     AWAIT_ROLL = "await_roll"
     NEGOTIATE = "negotiate"
     AWAIT_CHOICE = "await_choice"
+    #: A rent demand is outstanding — the debtor must agree, counter, or raise cash.
+    AWAIT_RENT = "await_rent"
     RESOLVING = "resolving"
     FINISHED = "finished"
 
@@ -30,6 +32,46 @@ class ConstraintKind(str, Enum):
 class Constraint:
     kind: ConstraintKind
     seat_index: int
+
+
+@dataclass(frozen=True)
+class RentDemand:
+    """Rent owed but not yet settled.
+
+    Rent is a DEMAND, not an instant debit: the debtor may agree, or counter
+    once. The owner then accepts or insists, and their answer is final —
+    otherwise a table can haggle forever and only the clock decides.
+    """
+
+    debtor_seat: int
+    owner_seat: int
+    square_index: int
+    amount: int
+    offered: Optional[int] = None
+    #: True once a counter has been made — one per demand.
+    countered: bool = False
+
+    @property
+    def due(self) -> int:
+        """What is actually payable right now."""
+        return self.amount if self.offered is None else self.offered
+
+
+@dataclass(frozen=True)
+class Loan:
+    """Credit advanced against pledged squares.
+
+    Interest is charged on passing GO — one lap, one cycle. That hook is
+    deterministic (no clock) and ties the cost of debt to tempo, which is a real
+    tension with the dice market: buying bigger moves gets you round faster.
+    """
+
+    loan_id: int
+    seat: int
+    principal: int
+    outstanding: int
+    collateral: Tuple[int, ...]
+    rate_bp: int
 
 
 @dataclass(frozen=True)
@@ -57,6 +99,9 @@ class MatchState:
     deck_cursors: Mapping[str, int] = None  # type: ignore[assignment]
     seq: int = 0
     winner_seat: Optional[int] = None
+    pending_demand: Optional[RentDemand] = None
+    loans: Tuple[Loan, ...] = ()
+    next_loan_id: int = 1
 
     def __post_init__(self) -> None:
         # Frozen dataclass: use object.__setattr__ to normalise defaults once.
@@ -120,6 +165,28 @@ class MatchState:
     def bump(self) -> "MatchState":
         return replace(self, seq=self.seq + 1)
 
+    # ------------------------------------------------------------- economy
+
+    def loans_of(self, seat_index: int) -> Tuple[Loan, ...]:
+        return tuple(loan for loan in self.loans if loan.seat == seat_index)
+
+    def debt_of(self, seat_index: int) -> int:
+        return sum(loan.outstanding for loan in self.loans_of(seat_index))
+
+    def pledged_squares(self, seat_index: Optional[int] = None) -> Tuple[int, ...]:
+        """Squares locked as collateral — they cannot be sold while pledged."""
+        pledged: list = []
+        for loan in self.loans:
+            if seat_index is None or loan.seat == seat_index:
+                pledged.extend(loan.collateral)
+        return tuple(sorted(set(pledged)))
+
+    def with_loans(self, loans: Tuple[Loan, ...]) -> "MatchState":
+        return replace(self, loans=loans)
+
+    def with_demand(self, demand: Optional[RentDemand]) -> "MatchState":
+        return replace(self, pending_demand=demand)
+
     # -------------------------------------------------------------- identity
 
     def state_hash(self) -> str:
@@ -150,6 +217,9 @@ class MatchState:
             "deck_cursors": {k: v for k, v in sorted(self.deck_cursors.items())},
             "seq": self.seq,
             "winner_seat": self.winner_seat,
+            "pending_demand": _demand_payload(self.pending_demand),
+            "loans": [_loan_payload(loan) for loan in self.loans],
+            "next_loan_id": self.next_loan_id,
         }
         encoded = json.dumps(payload, sort_keys=True, separators=(",", ":"))
         return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
@@ -186,6 +256,9 @@ class MatchState:
                     "deck_cursors": dict(self.deck_cursors),
                     "seq": self.seq,
                     "winner_seat": self.winner_seat,
+                    "pending_demand": _demand_payload(self.pending_demand),
+                    "loans": [_loan_payload(loan) for loan in self.loans],
+                    "next_loan_id": self.next_loan_id,
                 }
             )
         )
@@ -221,7 +294,59 @@ class MatchState:
             deck_cursors=dict(payload.get("deck_cursors", {})),
             seq=payload["seq"],
             winner_seat=payload.get("winner_seat"),
+            pending_demand=_demand_from(payload.get("pending_demand")),
+            loans=tuple(_loan_from(row) for row in payload.get("loans", [])),
+            next_loan_id=payload.get("next_loan_id", 1),
         )
+
+
+def _demand_payload(demand: Optional[RentDemand]) -> Optional[Dict]:
+    if demand is None:
+        return None
+    return {
+        "debtor_seat": demand.debtor_seat,
+        "owner_seat": demand.owner_seat,
+        "square_index": demand.square_index,
+        "amount": demand.amount,
+        "offered": demand.offered,
+        "countered": demand.countered,
+        "due": demand.due,
+    }
+
+
+def _demand_from(payload: Optional[Dict]) -> Optional[RentDemand]:
+    if not payload:
+        return None
+    return RentDemand(
+        debtor_seat=payload["debtor_seat"],
+        owner_seat=payload["owner_seat"],
+        square_index=payload["square_index"],
+        amount=payload["amount"],
+        offered=payload.get("offered"),
+        countered=payload.get("countered", False),
+    )
+
+
+def _loan_payload(loan: Loan) -> Dict:
+    return {
+        "loan_id": loan.loan_id,
+        "seat": loan.seat,
+        "principal": loan.principal,
+        "outstanding": loan.outstanding,
+        "collateral": list(loan.collateral),
+        "rate_bp": loan.rate_bp,
+    }
+
+
+def _loan_from(payload: Dict) -> Loan:
+    return Loan(
+        loan_id=payload["loan_id"],
+        seat=payload["seat"],
+        principal=payload["principal"],
+        outstanding=payload["outstanding"],
+        collateral=tuple(payload["collateral"]),
+        rate_bp=payload["rate_bp"],
+    )
 
 
 def initial_state(seat_count: int, starting_cash: int) -> MatchState:

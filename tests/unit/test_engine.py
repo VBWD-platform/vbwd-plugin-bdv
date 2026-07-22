@@ -301,6 +301,12 @@ class TestBribeToFate:
             cfg,
             Action(ActionType.CHOOSE_OPTION, 0, {"steps": 5}),
         ).state
+        # +5 lands on seat 1's Enterprise Renewal, which now raises a rent
+        # demand (S146-9) — settle it before the turn can end.
+        if state.pending_demand is not None:
+            state = apply(
+                state, worked_example_spec, cfg, Action(ActionType.AGREE_TO_PAY, 0)
+            ).state
         state = apply(
             state, worked_example_spec, cfg, Action(ActionType.END_TURN, 0)
         ).state
@@ -332,18 +338,35 @@ class TestPropertyAndRent:
         with pytest.raises(IllegalActionError):
             apply(state, tiny_spec, config, Action(ActionType.BUY_PROPERTY, 0))
 
-    def test_rent_transfers_from_visitor_to_owner(self, tiny_spec, config):
+    def test_landing_on_an_owned_square_raises_a_demand(self, tiny_spec, config):
+        """Rent is a DEMAND now — it must not debit silently (S146-9)."""
+        state = new_match(tiny_spec, config).with_ownership(3, 1)
+        state = dataclasses.replace(
+            state, pending_roll=(1, 2), phase=Phase.AWAIT_CHOICE
+        )
+        before = [s.cash for s in state.seats]
+        result = apply(
+            state, tiny_spec, config, Action(ActionType.CHOOSE_OPTION, 0, {"steps": 3})
+        )
+        assert any(e["type"] == "rent_demanded" for e in result.events)
+        assert result.state.pending_demand is not None
+        assert result.state.phase == Phase.AWAIT_RENT
+        assert [s.cash for s in result.state.seats] == before, "nothing debited yet"
+
+    def test_agreeing_settles_the_demand_and_is_zero_sum(self, tiny_spec, config):
         state = new_match(tiny_spec, config).with_ownership(3, 1)
         state = dataclasses.replace(
             state, pending_roll=(1, 2), phase=Phase.AWAIT_CHOICE
         )
         total_before = sum(s.cash for s in state.seats)
-        result = apply(
+        state = apply(
             state, tiny_spec, config, Action(ActionType.CHOOSE_OPTION, 0, {"steps": 3})
-        )
+        ).state
+        result = apply(state, tiny_spec, config, Action(ActionType.AGREE_TO_PAY, 0))
         rent_event = next(e for e in result.events if e["type"] == "paid_rent")
         assert rent_event["to"] == 1
         assert sum(s.cash for s in result.state.seats) == total_before
+        assert result.state.pending_demand is None
 
 
 class TestTaxJailAndSalary:
@@ -382,16 +405,23 @@ class TestTaxJailAndSalary:
 
 
 class TestBankruptcyAndMatchEnd:
-    def test_negative_cash_bankrupts_and_releases_property(self, tiny_spec, config):
+    def test_a_seat_with_nothing_left_can_declare_bankruptcy_on_a_demand(
+        self, tiny_spec, config
+    ):
+        """Bankruptcy is now a CHOICE at the end of the solvency ladder, not an
+        automatic consequence of landing on an expensive square (S146-10)."""
         state = new_match(tiny_spec, config).with_ownership(3, 1)
         state = state.with_seat(SeatState(index=0, cash=5, position=0))
         state = state.with_houses(3, 4)
         state = dataclasses.replace(
             state, pending_roll=(1, 2), phase=Phase.AWAIT_CHOICE
         )
-        result = apply(
+        state = apply(
             state, tiny_spec, config, Action(ActionType.CHOOSE_OPTION, 0, {"steps": 3})
-        )
+        ).state
+        assert state.pending_demand is not None, "a demand, not an instant bust"
+        # Seat 0 owns nothing, so there is nothing to sell or pledge.
+        result = apply(state, tiny_spec, config, Action(ActionType.DECLARE_BANKRUPT, 0))
         assert result.state.seat(0).bankrupt is True
 
     def test_last_solvent_seat_wins(self, tiny_spec, config):

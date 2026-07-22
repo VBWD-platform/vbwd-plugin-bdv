@@ -9,6 +9,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field, replace
 from typing import Dict, List, Mapping, Optional, Tuple
 
+from . import economy
 from .board import BoardSpec, SquareKind
 from .dice import roll_at, shuffled_order
 from .effects import apply_effect
@@ -25,6 +26,7 @@ from .state import (
     ConstraintKind,
     MatchState,
     Phase,
+    RentDemand,
     initial_state,
 )
 
@@ -43,6 +45,20 @@ class ConstraintViolationError(EngineError):
 
 class ActionType:
     ROLL = "roll"
+    # --- rent demand (S146-9)
+    AGREE_TO_PAY = "agree_to_pay"
+    RENT_AUTO_AGREED = "rent_auto_agreed"
+    OFFER_RENT = "offer_rent"
+    ACCEPT_RENT_OFFER = "accept_rent_offer"
+    INSIST_ON_FULL_RENT = "insist_on_full_rent"
+    # --- solvency + assets (S146-10 / S146-11)
+    BUILD_HOUSE = "build_house"
+    SELL_HOUSE = "sell_house"
+    SELL_SQUARE = "sell_square"
+    BORROW = "borrow"
+    REPAY_LOAN = "repay_loan"
+    # --- table economy (S146-12)
+    TRANSFER_CREDITS = "transfer_credits"
     OPEN_NEGOTIATION = "open_negotiation"
     ACCEPT_BRIBE = "accept_bribe"
     CHOOSE_OPTION = "choose_option"
@@ -73,6 +89,10 @@ class MatchConfig:
     seat_count: int
     chance_deck_size: int = 0
     community_deck_size: int = 0
+    #: Basis points of the pledged value a seat may borrow (5000 = 50 %).
+    loan_to_value: int = 5000
+    #: Basis points charged per lap on outstanding debt (1000 = 10 %).
+    loan_rate_bp: int = 1000
 
 
 def new_match(spec: BoardSpec, config: MatchConfig) -> MatchState:
@@ -253,6 +273,8 @@ def _handle_choose_option(state, spec, config, action) -> ApplyResult:
     if working.seat(action.seat_index).bankrupt:
         # A seat that busts during resolution has no turn left to take.
         working = _advance_turn(working, spec)
+    elif working.pending_demand is not None:
+        working = replace(working, phase=Phase.AWAIT_RENT)
     else:
         working = replace(working, phase=Phase.RESOLVING)
     return ApplyResult(working.bump(), tuple(events))
@@ -274,6 +296,10 @@ def _move_and_resolve(
         events.append(
             {"type": "go_salary", "seat": seat_index, "amount": spec.go_salary}
         )
+        # One lap = one interest cycle. Deterministic, and it ties the cost of
+        # debt to tempo — racing round the board pays interest more often.
+        working, interest_events = economy.charge_interest(working, seat_index)
+        events.extend(interest_events)
 
     square = spec.square(destination)
 
@@ -307,11 +333,19 @@ def _move_and_resolve(
         if owner is not None and owner != seat_index:
             rent = rent_due(working, spec, destination, steps)
             if rent:
-                working = working.with_cash_delta(seat_index, -rent)
-                working = working.with_cash_delta(owner, rent)
+                # Rent is a DEMAND, not a silent debit: the debtor must agree or
+                # counter, and may have to raise cash first.
+                working = working.with_demand(
+                    RentDemand(
+                        debtor_seat=seat_index,
+                        owner_seat=owner,
+                        square_index=destination,
+                        amount=rent,
+                    )
+                )
                 events.append(
                     {
-                        "type": "paid_rent",
+                        "type": "rent_demanded",
                         "seat": seat_index,
                         "to": owner,
                         "amount": rent,
@@ -328,7 +362,7 @@ def _move_and_resolve(
                 }
             )
 
-    working, bankruptcy_events = _settle_bankruptcy(working, seat_index)
+    working, bankruptcy_events = _settle_bankruptcy(working, seat_index, spec)
     events.extend(bankruptcy_events)
     return working, events
 
@@ -412,6 +446,8 @@ def _handle_decline_purchase(state, spec, config, action) -> ApplyResult:
 
 def _handle_end_turn(state, spec, config, action) -> ApplyResult:
     _require_turn(state, action.seat_index)
+    if state.pending_demand is not None:
+        raise IllegalActionError("settle the rent demand before ending your turn")
     return ApplyResult(
         _advance_turn(state, spec).bump(),
         ({"type": "turn_ended", "seat": action.seat_index},),
@@ -429,11 +465,216 @@ def _handle_declare_bankrupt(state, spec, config, action) -> ApplyResult:
     )
 
 
+def _require_demand(state: MatchState) -> RentDemand:
+    if state.pending_demand is None:
+        raise IllegalActionError("there is no rent demand outstanding")
+    return state.pending_demand
+
+
+def _settle_demand(state, spec, demand: RentDemand):
+    """Pay what was agreed. The debtor must already be able to cover it."""
+    amount = demand.due
+    seat = state.seat(demand.debtor_seat)
+    if seat.cash < amount:
+        raise IllegalActionError(
+            f"you are {amount - seat.cash} short — sell or borrow first"
+        )
+    working = state.with_cash_delta(demand.debtor_seat, -amount)
+    working = working.with_cash_delta(demand.owner_seat, amount)
+    working = working.with_demand(None)
+    working = replace(working, phase=Phase.RESOLVING)
+    return working, {
+        "type": "paid_rent",
+        "seat": demand.debtor_seat,
+        "to": demand.owner_seat,
+        "amount": amount,
+        "square": demand.square_index,
+        "negotiated": demand.offered is not None,
+    }
+
+
+def _handle_agree_to_pay(state, spec, config, action) -> ApplyResult:
+    demand = _require_demand(state)
+    if action.seat_index != demand.debtor_seat:
+        raise IllegalActionError("only the debtor may agree to pay")
+    working, event = _settle_demand(state, spec, demand)
+    return ApplyResult(working.bump(), (event,))
+
+
+def _handle_rent_auto_agreed(state, spec, config, action) -> ApplyResult:
+    """The 60-second timeout, recorded as an ACTION.
+
+    The clock lives in the service layer; the engine only ever sees the recorded
+    fact, so a replay reproduces the auto-agreement exactly instead of
+    re-evaluating a deadline.
+    """
+    demand = _require_demand(state)
+    working, event = _settle_demand(state, spec, demand)
+    event["auto"] = True
+    return ApplyResult(working.bump(), (event,))
+
+
+def _handle_offer_rent(state, spec, config, action) -> ApplyResult:
+    demand = _require_demand(state)
+    if action.seat_index != demand.debtor_seat:
+        raise IllegalActionError("only the debtor may counter")
+    if demand.countered:
+        raise IllegalActionError("you have already made a counter-offer")
+    amount = int(action.payload["amount"])
+    if amount <= 0 or amount >= demand.amount:
+        raise IllegalActionError("a counter must be above zero and below the rent")
+    working = state.with_demand(replace(demand, offered=amount, countered=True)).bump()
+    return ApplyResult(
+        working,
+        (
+            {
+                "type": "rent_countered",
+                "seat": demand.debtor_seat,
+                "to": demand.owner_seat,
+                "offered": amount,
+                "rent": demand.amount,
+            },
+        ),
+    )
+
+
+def _handle_accept_rent_offer(state, spec, config, action) -> ApplyResult:
+    demand = _require_demand(state)
+    if action.seat_index != demand.owner_seat:
+        raise IllegalActionError("only the owner may accept")
+    if demand.offered is None:
+        raise IllegalActionError("there is no counter-offer to accept")
+    working, event = _settle_demand(state, spec, demand)
+    event["accepted_offer"] = True
+    return ApplyResult(working.bump(), (event,))
+
+
+def _handle_insist_on_full_rent(state, spec, config, action) -> ApplyResult:
+    """The owner's answer is final — otherwise a table haggles forever."""
+    demand = _require_demand(state)
+    if action.seat_index != demand.owner_seat:
+        raise IllegalActionError("only the owner may insist")
+    working = state.with_demand(replace(demand, offered=None)).bump()
+    return ApplyResult(
+        working,
+        (
+            {
+                "type": "rent_insisted",
+                "seat": demand.owner_seat,
+                "debtor": demand.debtor_seat,
+                "amount": demand.amount,
+            },
+        ),
+    )
+
+
+# ---------------------------------------------------------- solvency + assets
+
+
+def _require_own_turn_phase(state, seat_index, *phases):
+    _require_turn(state, seat_index)
+    if state.phase not in phases:
+        raise IllegalActionError(f"not allowed in phase {state.phase.value!r}")
+
+
+def _handle_build_house(state, spec, config, action) -> ApplyResult:
+    # Building is restricted to AWAIT_ROLL so it stays a bet about the board
+    # rather than a hedge against a roll you have already seen.
+    _require_own_turn_phase(state, action.seat_index, Phase.AWAIT_ROLL)
+    working, event = economy.build_house(
+        state, spec, action.seat_index, int(action.payload["square"])
+    )
+    return ApplyResult(working.bump(), (event,))
+
+
+def _handle_sell_house(state, spec, config, action) -> ApplyResult:
+    _require_turn(state, action.seat_index)
+    working, event = economy.sell_house(
+        state, spec, action.seat_index, int(action.payload["square"])
+    )
+    return ApplyResult(working.bump(), (event,))
+
+
+def _handle_sell_square(state, spec, config, action) -> ApplyResult:
+    _require_turn(state, action.seat_index)
+    working, event = economy.sell_square(
+        state, spec, action.seat_index, int(action.payload["square"])
+    )
+    return ApplyResult(working.bump(), (event,))
+
+
+def _handle_borrow(state, spec, config, action) -> ApplyResult:
+    _require_turn(state, action.seat_index)
+    working, event = economy.borrow(
+        state,
+        spec,
+        action.seat_index,
+        [int(i) for i in action.payload.get("squares", [])],
+        int(action.payload["amount"]),
+        loan_to_value=config.loan_to_value,
+        rate_bp=config.loan_rate_bp,
+    )
+    return ApplyResult(working.bump(), (event,))
+
+
+def _handle_repay_loan(state, spec, config, action) -> ApplyResult:
+    _require_turn(state, action.seat_index)
+    working, event = economy.repay_loan(
+        state,
+        action.seat_index,
+        int(action.payload["loan_id"]),
+        int(action.payload["amount"]),
+    )
+    return ApplyResult(working.bump(), (event,))
+
+
+def _handle_transfer_credits(state, spec, config, action) -> ApplyResult:
+    """A side payment between seats.
+
+    These are IN-GAME credits: created at match start, destroyed at match end,
+    never purchasable and never cashable. A transfer is a move, not a payment.
+    """
+    sender = action.seat_index
+    recipient = int(action.payload["to_seat"])
+    amount = int(action.payload["amount"])
+    if amount <= 0:
+        raise IllegalActionError("amount must be positive")
+    if recipient == sender:
+        raise IllegalActionError("you cannot pay yourself")
+    if not 0 <= recipient < len(state.seats):
+        raise IllegalActionError("no such seat")
+    if state.seat(recipient).bankrupt:
+        raise IllegalActionError("that seat is out of the match")
+    if state.seat(sender).cash < amount:
+        raise IllegalActionError("not enough cash")
+
+    working = state.with_cash_delta(sender, -amount).with_cash_delta(recipient, amount)
+    return ApplyResult(
+        working.bump(),
+        (
+            {
+                "type": "credits_transferred",
+                "seat": sender,
+                "to": recipient,
+                "amount": amount,
+            },
+        ),
+    )
+
+
 def _settle_bankruptcy(
-    state: MatchState, seat_index: int
+    state: MatchState, seat_index: int, spec: Optional[BoardSpec] = None
 ) -> Tuple[MatchState, List[Dict]]:
     seat = state.seat(seat_index)
     if seat.bankrupt or seat.cash >= 0:
+        return state, []
+    # Bankruptcy is what happens when liquidating EVERYTHING still falls short —
+    # a computed fact, not a first resort. With assets left the seat keeps the
+    # shortfall and must sell or borrow.
+    if (
+        spec is not None
+        and economy.liquidation_value(state, spec, seat_index) + seat.cash >= 0
+    ):
         return state, []
     working = _bankrupt_seat(state, seat_index)
     working, events = _check_match_end(working)
@@ -443,6 +684,12 @@ def _settle_bankruptcy(
 def _bankrupt_seat(state: MatchState, seat_index: int) -> MatchState:
     seat = state.seat(seat_index)
     working = state.with_seat(replace(seat, bankrupt=True, cash=0))
+    # Collateral goes to the bank and the loans clear.
+    working, _ = economy.seize_collateral(working, seat_index)
+    if working.pending_demand is not None and (
+        working.pending_demand.debtor_seat == seat_index
+    ):
+        working = working.with_demand(None)
     for square in state.owned_by(seat_index):
         working = working.with_ownership(square, None).with_houses(square, 0)
     return working
@@ -472,6 +719,9 @@ def _advance_turn(state: MatchState, spec: BoardSpec) -> MatchState:
         phase=Phase.AWAIT_ROLL,
         pending_roll=None,
         constraints=(),
+        # A demand cannot outlive the turn it arose in — otherwise the next seat
+        # inherits a debt it never incurred and can never end its turn.
+        pending_demand=None,
     )
 
 
@@ -484,6 +734,17 @@ _HANDLERS = {
     ActionType.DECLINE_PURCHASE: _handle_decline_purchase,
     ActionType.END_TURN: _handle_end_turn,
     ActionType.DECLARE_BANKRUPT: _handle_declare_bankrupt,
+    ActionType.AGREE_TO_PAY: _handle_agree_to_pay,
+    ActionType.RENT_AUTO_AGREED: _handle_rent_auto_agreed,
+    ActionType.OFFER_RENT: _handle_offer_rent,
+    ActionType.ACCEPT_RENT_OFFER: _handle_accept_rent_offer,
+    ActionType.INSIST_ON_FULL_RENT: _handle_insist_on_full_rent,
+    ActionType.BUILD_HOUSE: _handle_build_house,
+    ActionType.SELL_HOUSE: _handle_sell_house,
+    ActionType.SELL_SQUARE: _handle_sell_square,
+    ActionType.BORROW: _handle_borrow,
+    ActionType.REPAY_LOAN: _handle_repay_loan,
+    ActionType.TRANSFER_CREDITS: _handle_transfer_credits,
 }
 
 

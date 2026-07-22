@@ -618,3 +618,85 @@ class TestPurchaseOffer:
     def test_no_offer_when_it_is_not_your_turn(self, db, board, service):
         match = self._match(service, board)
         assert service.purchase_offer(match, 1) is None
+
+
+class TestRentTimeoutIsRecordedNotDerived:
+    """The 60s auto-agree must be an ACTION, so replay stays exact (S146-9)."""
+
+    def _demanding(self, db, board, service):
+        import dataclasses
+
+        from plugins.bdv.bdv.core.state import Phase
+
+        match = service.create(
+            board,
+            created_by=None,
+            seats=[
+                {"kind": "baseline", "display_name": "You"},
+                {"kind": "baseline", "display_name": "A"},
+                {"kind": "baseline", "display_name": "B"},
+            ],
+            fill_policy="agents_now",
+        )
+        state = service.state_for(match)
+        # Square 1 (Cold List) is a deal square, so it charges rent. Seat 1 owns
+        # it and seat 0 starts on GO, one step away.
+        staged = state.with_ownership(1, 1)
+        staged = staged.with_seat(dataclasses.replace(staged.seat(0), position=0))
+        staged = dataclasses.replace(
+            staged, pending_roll=(1, 1), phase=Phase.AWAIT_CHOICE
+        )
+        match.state_snapshot = staged.to_dict()
+        match.state_seq = staged.seq
+        db.session.flush()
+        service.submit(
+            match, seat_index=0, action_type="choose_option", payload={"steps": 1}
+        )
+        return match
+
+    def test_a_demand_arms_the_timer(self, db, board, service):
+        match = self._demanding(db, board, service)
+        state = service.state_for(match)
+        assert state.pending_demand is not None, "Cold List must charge rent"
+        assert match.turn_deadline_at is not None
+        assert service.rent_deadline(match) is not None
+
+    def test_the_timeout_fires_once_and_is_logged_as_an_action(
+        self, db, board, service
+    ):
+        from datetime import datetime, timedelta, timezone
+
+        match = self._demanding(db, board, service)
+        assert service.state_for(match).pending_demand is not None
+
+        match.turn_deadline_at = datetime.now(timezone.utc) - timedelta(seconds=1)
+        db.session.flush()
+
+        assert service.resolve_rent_timeout(match) is True
+        assert service.state_for(match).pending_demand is None
+        types = [row["type"] for row in service.events_since(match)]
+        assert "rent_auto_agreed" in types, "recorded as a fact, not re-derived"
+        # Firing again is a no-op.
+        assert service.resolve_rent_timeout(match) is False
+
+    def test_the_auto_agree_moves_the_money(self, db, board, service):
+        """NOTE: this class stages its board by writing the snapshot directly, so
+        it deliberately does NOT assert fold == snapshot — that invariant only
+        holds when every change came from a logged action, and it is covered by
+        TestActionLogIsTheSourceOfTruth and the full-match test."""
+        from datetime import datetime, timedelta, timezone
+
+        match = self._demanding(db, board, service)
+        before = service.state_for(match)
+        demand = before.pending_demand
+        assert demand is not None
+        debtor_cash = before.seat(demand.debtor_seat).cash
+        owner_cash = before.seat(demand.owner_seat).cash
+
+        match.turn_deadline_at = datetime.now(timezone.utc) - timedelta(seconds=1)
+        db.session.flush()
+        service.resolve_rent_timeout(match)
+
+        after = service.state_for(match)
+        assert after.seat(demand.debtor_seat).cash == debtor_cash - demand.amount
+        assert after.seat(demand.owner_seat).cash == owner_cash + demand.amount

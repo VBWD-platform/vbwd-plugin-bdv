@@ -13,6 +13,7 @@ from __future__ import annotations
 
 from typing import Optional, Tuple
 
+from ..core import economy
 from ..core.board import BoardSpec
 from ..core.engine import Action, ActionType
 from ..core.pricing import OptionQuote, evaluate_options
@@ -27,8 +28,11 @@ class BaselineSeat:
 
     seat_kind = "baseline"
 
-    def __init__(self, cash_reserve: int = CASH_RESERVE) -> None:
+    def __init__(
+        self, cash_reserve: int = CASH_RESERVE, loan_to_value: int = 5000
+    ) -> None:
         self.cash_reserve = cash_reserve
+        self.loan_to_value = loan_to_value
 
     # ------------------------------------------------------------- decisions
 
@@ -80,11 +84,68 @@ class BaselineSeat:
 
     # ------------------------------------------------------------ turn driver
 
+    # -------------------------------------------------------------- solvency
+
+    def raise_cash_action(
+        self, state: MatchState, spec: BoardSpec, seat_index: int, needed: int
+    ) -> Optional[Action]:
+        """One step towards covering ``needed``, or None if nothing is left.
+
+        Deterministic ladder, boring on purpose — this is the control group the
+        balance harness measures against: sell buildings, then borrow at the
+        cap, then sell squares.
+        """
+        if needed <= 0:
+            return None
+
+        # 1. Buildings first — they are the cheapest thing to give up.
+        for square_index in state.owned_by(seat_index):
+            if economy.can_sell_house(state, spec, seat_index, square_index) is None:
+                return Action(
+                    ActionType.SELL_HOUSE, seat_index, {"square": square_index}
+                )
+
+        # 2. Borrow against something unpledged — keeps the asset earning.
+        pledged = set(state.pledged_squares(seat_index))
+        free = [i for i in state.owned_by(seat_index) if i not in pledged]
+        if free:
+            ceiling = (
+                sum(economy.square_value(spec, i) for i in free) * self.loan_to_value
+            ) // 10_000
+            if ceiling > 0:
+                return Action(
+                    ActionType.BORROW,
+                    seat_index,
+                    {"squares": list(free), "amount": min(ceiling, needed)},
+                )
+
+        # 3. Sell a square outright — permanent, so it comes last.
+        for square_index in state.owned_by(seat_index):
+            if economy.can_sell_square(state, spec, seat_index, square_index) is None:
+                return Action(
+                    ActionType.SELL_SQUARE, seat_index, {"square": square_index}
+                )
+        return None
+
     def next_action(
         self, state: MatchState, spec: BoardSpec, seat_index: int
     ) -> Action:
         """The single action this seat would take right now."""
         from ..core.state import Phase
+
+        # A rent demand outranks everything: the turn cannot end while it stands.
+        demand = state.pending_demand
+        if demand is not None:
+            if seat_index == demand.owner_seat and demand.offered is not None:
+                # Boring and deterministic: take the offer rather than gamble on
+                # a forced sale that might destroy the value.
+                return Action(ActionType.ACCEPT_RENT_OFFER, seat_index)
+            if seat_index == demand.debtor_seat:
+                shortfall = demand.due - state.seat(seat_index).cash
+                if shortfall <= 0:
+                    return Action(ActionType.AGREE_TO_PAY, seat_index)
+                raising = self.raise_cash_action(state, spec, seat_index, shortfall)
+                return raising or Action(ActionType.DECLARE_BANKRUPT, seat_index)
 
         if state.phase == Phase.AWAIT_ROLL:
             return Action(ActionType.ROLL, seat_index)

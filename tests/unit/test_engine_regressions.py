@@ -37,9 +37,11 @@ class TestBankruptcyDuringResolution:
             pending_roll=(1, 2),
             phase=Phase.AWAIT_CHOICE,
         )
-        result = apply(
+        state = apply(
             state, tiny_spec, config, Action(ActionType.CHOOSE_OPTION, 0, {"steps": 3})
-        )
+        ).state
+        # S146-9: rent is a demand, so the bust happens when the seat gives up.
+        result = apply(state, tiny_spec, config, Action(ActionType.DECLARE_BANKRUPT, 0))
         assert result.state.seat(0).bankrupt is True
         assert result.state.turn_seat != 0, "the busted seat must not still be on turn"
         assert result.state.phase == Phase.AWAIT_ROLL
@@ -61,6 +63,9 @@ class TestBankruptcyDuringResolution:
         )
         state = apply(
             state, tiny_spec, config, Action(ActionType.CHOOSE_OPTION, 0, {"steps": 3})
+        ).state
+        state = apply(
+            state, tiny_spec, config, Action(ActionType.DECLARE_BANKRUPT, 0)
         ).state
         # Must not raise "seat is bankrupt" / "out of turn".
         follow_up = apply(
@@ -86,9 +91,11 @@ class TestMatchEndIsNeverOverwritten:
             pending_roll=(1, 2),
             phase=Phase.AWAIT_CHOICE,
         )
-        result = apply(
+        state = apply(
             state, tiny_spec, config, Action(ActionType.CHOOSE_OPTION, 0, {"steps": 3})
-        )
+        ).state
+        # S146-9: rent is a demand, so the match ends when the debtor gives up.
+        result = apply(state, tiny_spec, config, Action(ActionType.DECLARE_BANKRUPT, 0))
         assert (
             result.state.phase == Phase.FINISHED
         ), "phase=RESOLVING must never clobber a finished match"
@@ -111,6 +118,9 @@ class TestMatchEndIsNeverOverwritten:
         )
         state = apply(
             state, tiny_spec, config, Action(ActionType.CHOOSE_OPTION, 0, {"steps": 3})
+        ).state
+        state = apply(
+            state, tiny_spec, config, Action(ActionType.DECLARE_BANKRUPT, 0)
         ).state
         with pytest.raises(IllegalActionError):
             apply(state, tiny_spec, config, Action(ActionType.ROLL, 1))

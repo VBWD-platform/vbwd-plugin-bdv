@@ -648,6 +648,10 @@ def match_detail(match_id):
     # get played — a browser can never move an agent seat itself.
     service = _match_service()
     service.resolve_lobby(match)
+    # The 60-second rent auto-agree is evaluated lazily on read, like the lobby
+    # deadline — no scheduler, and it records an explicit action so replay stays
+    # exact.
+    service.resolve_rent_timeout(match)
     service.advance_agents(match)
     db.session.commit()
 
@@ -660,6 +664,8 @@ def match_detail(match_id):
     payload["purchase_offer"] = (
         service.purchase_offer(match, seat_index) if seat_index is not None else None
     )
+    deadline = service.rent_deadline(match)
+    payload["rent_deadline_at"] = deadline.isoformat() if deadline else None
     return jsonify(payload), 200
 
 
@@ -776,6 +782,44 @@ def match_events(match_id):
         ),
         200,
     )
+
+
+@bdv_bp.route(f"{PLAY}/matches/<match_id>/messages", methods=["GET", "POST"])
+@require_auth
+@require_user_permission("bdv.play")
+def match_messages(match_id):
+    """Table chat. Only seats may read or post — this is a private table."""
+    from .models.match import BdvMessage
+
+    match = _matches().find_by_id(match_id)
+    if not match:
+        return jsonify({"error": "match not found"}), 404
+    seat_index = _authorised_seat(match)
+    if seat_index is None:
+        return jsonify({"error": "not a seat in this match"}), 403
+
+    if request.method == "GET":
+        rows = (
+            db.session.query(BdvMessage)
+            .filter(BdvMessage.match_id == match.id)
+            .order_by(BdvMessage.created_at.asc())
+            .limit(200)
+            .all()
+        )
+        return jsonify({"items": [row.to_dict() for row in rows]}), 200
+
+    body = ((request.get_json(silent=True) or {}).get("body") or "").strip()
+    if not body:
+        return jsonify({"error": "message is empty"}), 422
+    message = BdvMessage(
+        match_id=match.id,
+        seat_index=seat_index,
+        user_id=_current_user_id(),
+        body=body[:500],
+    )
+    db.session.add(message)
+    db.session.commit()
+    return jsonify(message.to_dict()), 201
 
 
 @bdv_bp.route(f"{PLAY}/matches/<match_id>/offers", methods=["GET", "POST"])

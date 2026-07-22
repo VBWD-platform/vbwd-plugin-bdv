@@ -253,7 +253,31 @@ class MatchService:
         played = 0
         for _ in range(max_actions):
             state = self.state_for(match)
-            if state.phase == Phase.FINISHED or state.turn_seat not in agent_seats:
+            if state.phase == Phase.FINISHED:
+                break
+
+            # An agent OWNER must answer a counter-offer even though the turn
+            # belongs to the debtor — otherwise a human counter hangs forever.
+            demand = state.pending_demand
+            if (
+                demand is not None
+                and demand.offered is not None
+                and demand.owner_seat in agent_seats
+            ):
+                action = agent.next_action(state, spec, demand.owner_seat)
+                try:
+                    self.submit(
+                        match,
+                        seat_index=action.seat_index,
+                        action_type=action.type,
+                        payload=dict(action.payload),
+                    )
+                except MatchError:
+                    break
+                played += 1
+                continue
+
+            if state.turn_seat not in agent_seats:
                 break
             action = agent.next_action(state, spec, state.turn_seat)
             try:
@@ -384,6 +408,51 @@ class MatchService:
         self._persist_state(match, result.state)
         return result.state, list(result.events)
 
+    # --------------------------------------------------------- rent timeout
+
+    def rent_deadline(self, match: BdvMatch) -> Optional[datetime]:
+        """When the outstanding demand auto-agrees, or None."""
+        if match.turn_deadline_at is None:
+            return None
+        state = self.state_for(match)
+        return _aware(match.turn_deadline_at) if state.pending_demand else None
+
+    def arm_rent_timer(self, match: BdvMatch, seconds: int = 60) -> None:
+        state = self.state_for(match)
+        if state.pending_demand is None:
+            match.turn_deadline_at = None
+        elif match.turn_deadline_at is None:
+            match.turn_deadline_at = _now() + timedelta(seconds=seconds)
+        self._session.flush()
+
+    def resolve_rent_timeout(self, match: BdvMatch) -> bool:
+        """Fire the 60-second auto-agree if it is due.
+
+        The clock lives HERE, never in the engine: this records an explicit
+        ``rent_auto_agreed`` action, so a replay reproduces the auto-agreement
+        as a fact rather than re-deriving a deadline.
+        """
+        state = self.state_for(match)
+        demand = state.pending_demand
+        if demand is None or match.turn_deadline_at is None:
+            return False
+        if _now() < _aware(match.turn_deadline_at):
+            return False
+        try:
+            self.submit(
+                match,
+                seat_index=demand.debtor_seat,
+                action_type=ActionType.RENT_AUTO_AGREED,
+                payload={},
+            )
+        except MatchError:
+            # The debtor cannot cover it — leave the demand for them to resolve
+            # by selling or borrowing rather than forcing a bust on a timer.
+            return False
+        match.turn_deadline_at = None
+        self._session.flush()
+        return True
+
     # -------------------------------------------------------------- offers
 
     def offer_bribe(
@@ -447,6 +516,11 @@ class MatchService:
     def _persist_state(self, match: BdvMatch, state: MatchState) -> None:
         match.state_snapshot = state.to_dict()
         match.state_seq = state.seq
+        # Arm the rent clock when a demand appears; clear it when it settles.
+        if state.pending_demand is None:
+            match.turn_deadline_at = None
+        elif match.turn_deadline_at is None:
+            match.turn_deadline_at = _now() + timedelta(seconds=60)
         if state.phase == Phase.FINISHED:
             match.status = MATCH_STATUS_FINISHED
             match.winner_seat_index = state.winner_seat

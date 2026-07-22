@@ -8,6 +8,7 @@ from plugins.bdv.bdv.models.match import (  # noqa: F401
     BdvAction,
     BdvAgentProfile,
     BdvMatch,
+    BdvMessage,
     BdvOffer,
     BdvSeat,
 )

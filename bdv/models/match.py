@@ -224,6 +224,45 @@ class BdvOffer(BaseModel):
         }
 
 
+class BdvMessage(BaseModel):
+    """A human message at the table.
+
+    The sprint originally routed these through the match's meinchat room. That
+    did not survive contact with the migration graph: meinchat's migrations are
+    anchored on a ``subscription`` revision, so declaring a hard dependency on
+    it would break ``alembic upgrade heads`` for any deployment that does not
+    clone the whole chain — a failure this plugin already hit once in CI.
+
+    A plugin-owned table keeps bdv self-contained. The bot bridge still uses
+    meinchat as a TRANSPORT for tappable cards; only the in-app table chat lives
+    here, and it is a thin table by design.
+    """
+
+    __tablename__ = "bdv_message"
+
+    match_id = db.Column(
+        db.UUID(as_uuid=True),
+        db.ForeignKey("bdv_match.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    seat_index = db.Column(db.Integer, nullable=False)
+    user_id = db.Column(
+        db.UUID(as_uuid=True),
+        db.ForeignKey("vbwd_user.id", ondelete="SET NULL"),
+        nullable=True,
+    )
+    body = db.Column(db.String(500), nullable=False)
+
+    def to_dict(self) -> dict:
+        return {
+            "id": str(self.id),
+            "seat": self.seat_index,
+            "body": self.body,
+            "created_at": self.created_at.isoformat() if self.created_at else None,
+        }
+
+
 class BdvAgentProfile(BaseModel):
     """An LLM opponent. Data, not code — a new personality is a DB row."""
 
