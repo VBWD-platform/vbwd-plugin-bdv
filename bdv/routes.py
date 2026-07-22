@@ -6,6 +6,9 @@ run through every mutating handler:
 * the acting seat comes from the AUTHENTICATED user, never the request body;
 * prices are recomputed server-side — a client-supplied price is ignored.
 """
+import re
+from typing import Dict
+
 from flask import Blueprint, current_app, g, jsonify, request
 
 from vbwd.extensions import db
@@ -20,6 +23,7 @@ from .core.effects import op_descriptors, validate_effect
 from .core.engine import ActionType
 from .core.fees import available_fee_policies
 from .models.board import BOARD_STATUS_DRAFT, BOARD_STATUS_PUBLISHED, BdvBoard
+from .models.match import BdvAgentProfile
 from .models.match import (
     FILL_AGENTS_NOW,
     SEAT_KIND_BASELINE,
@@ -430,6 +434,258 @@ def modify_card(card_id):
     return jsonify(card.to_dict()), 200
 
 
+# ------------------------------------------------------------- admin: agents
+
+
+def _agents() -> AgentProfileRepository:
+    return AgentProfileRepository(db.session)
+
+
+def _slugify(value: str) -> str:
+    cleaned = re.sub(r"[^a-z0-9]+", "-", (value or "").strip().lower()).strip("-")
+    return cleaned or "agent"
+
+
+def _unique_slug(candidate: str) -> str:
+    repository = _agents()
+    base, suffix = _slugify(candidate), 2
+    slug = base
+    while repository.find_by_slug(slug):
+        slug = f"{base}-{suffix}"
+        suffix += 1
+    return slug
+
+
+def _connection_slugs(profiles) -> Dict[str, str]:
+    """Adapter slug per profile, resolved in ONE query.
+
+    The roster shows which core LLM connection an agent speaks through; looking
+    that up per row would be an N+1 on a page that already aggregates.
+    """
+    from vbwd.models.llm_connection import LlmConnection
+
+    wanted = {p.llm_connection_id for p in profiles if p.llm_connection_id}
+    if not wanted:
+        return {}
+    rows = (
+        db.session.query(LlmConnection.id, LlmConnection.slug)
+        .filter(LlmConnection.id.in_(wanted))
+        .all()
+    )
+    return {str(row_id): slug for row_id, slug in rows}
+
+
+def _agent_payload(profiles) -> list:
+    """Roster rows: the profile, its adapter, and its lifetime record."""
+    stats = _agents().lifetime_stats([p.id for p in profiles])
+    slugs = _connection_slugs(profiles)
+    items = []
+    for profile in profiles:
+        row = profile.to_dict()
+        row["llm_adapter_slug"] = slugs.get(str(profile.llm_connection_id))
+        row.update(
+            stats.get(
+                str(profile.id),
+                {"games_played": 0, "net_capital": 0, "games_won": 0},
+            )
+        )
+        items.append(row)
+    return items
+
+
+#: Lifetime columns are aggregates, not table columns — sorting them in SQL
+#: would need a second aggregate in the ORDER BY, so they sort on the page.
+_COMPUTED_SORTS = {"games_played", "net_capital", "games_won", "llm_adapter_slug"}
+
+
+@bdv_bp.route(f"{ADMIN}/agents", methods=["GET"])
+@require_auth
+@require_permission("bdv.agents.view")
+def list_agents():
+    page, per_page = _page_args()
+    sort = request.args.get("sort", "name")
+    order = request.args.get("order", "asc")
+    active = request.args.get("is_active")
+    rows, total = _agents().list_catalogue(
+        page=page,
+        per_page=per_page,
+        query=request.args.get("q"),
+        is_active=None if active in (None, "") else active == "true",
+        sort="name" if sort in _COMPUTED_SORTS else sort,
+        order=order,
+    )
+    items = _agent_payload(rows)
+    if sort in _COMPUTED_SORTS:
+        items.sort(
+            key=lambda r: (r.get(sort) is None, r.get(sort)), reverse=order == "desc"
+        )
+    return jsonify(paginate(items, total, page, per_page)), 200
+
+
+@bdv_bp.route(f"{ADMIN}/agents", methods=["POST"])
+@require_auth
+@require_permission("bdv.agents.manage")
+def create_agent():
+    data = request.get_json(silent=True) or {}
+    if not data.get("name"):
+        return jsonify({"error": "name is required"}), 422
+    if _agents().find_by_name(data["name"]):
+        return jsonify({"error": "an agent with that name already exists"}), 422
+
+    profile = BdvAgentProfile(
+        name=data["name"],
+        slug=_unique_slug(data.get("slug") or data["name"]),
+    )
+    _apply_agent_fields(profile, data)
+    db.session.add(profile)
+    db.session.commit()
+    return jsonify(profile.to_dict()), 201
+
+
+@bdv_bp.route(f"{ADMIN}/agents/<agent_id>", methods=["GET"])
+@require_auth
+@require_permission("bdv.agents.view")
+def get_agent(agent_id):
+    profile = _agents().find_by_id(agent_id)
+    if not profile:
+        return jsonify({"error": "agent not found"}), 404
+    return jsonify(_agent_payload([profile])[0]), 200
+
+
+@bdv_bp.route(f"{ADMIN}/agents/<agent_id>", methods=["PUT", "DELETE"])
+@require_auth
+@require_permission("bdv.agents.manage")
+def modify_agent(agent_id):
+    profile = _agents().find_by_id(agent_id)
+    if not profile:
+        return jsonify({"error": "agent not found"}), 404
+    if request.method == "DELETE":
+        db.session.delete(profile)
+        db.session.commit()
+        return jsonify({"deleted": True}), 200
+
+    data = request.get_json(silent=True) or {}
+    if data.get("slug") and data["slug"] != profile.slug:
+        profile.slug = _unique_slug(data["slug"])
+    _apply_agent_fields(profile, data)
+    db.session.commit()
+    return jsonify(profile.to_dict()), 200
+
+
+def _apply_agent_fields(profile: BdvAgentProfile, data: Dict) -> None:
+    for field in (
+        "name",
+        "persona",
+        "system_prompt",
+        "temperature",
+        "max_tokens_per_match",
+        "risk_bias",
+        "is_active",
+    ):
+        if field in data:
+            setattr(profile, field, data[field])
+    if "llm_connection_id" in data:
+        profile.llm_connection_id = data["llm_connection_id"] or None
+
+
+@bdv_bp.route(f"{ADMIN}/agents/bulk/<operation>", methods=["POST"])
+@require_auth
+@require_permission("bdv.agents.manage")
+def bulk_agents(operation):
+    if operation not in {"copy", "delete", "deactivate", "activate", "export"}:
+        return jsonify({"error": "unknown bulk operation"}), 422
+    ids = (request.get_json(silent=True) or {}).get("agent_ids") or []
+    repository = _agents()
+    updated, skipped, exported = [], [], []
+
+    for agent_id in ids:
+        profile = repository.find_by_id(agent_id)
+        if not profile:
+            skipped.append({"id": agent_id, "reason": "not_found"})
+            continue
+        if operation == "delete":
+            db.session.delete(profile)
+        elif operation == "deactivate":
+            profile.is_active = False
+        elif operation == "activate":
+            profile.is_active = True
+        elif operation == "copy":
+            _copy_agent(profile)
+        elif operation == "export":
+            # Export is READ-ONLY and deliberately drops the connection binding:
+            # a connection id is meaningless on another installation, and the
+            # slug is what a human matches on when importing.
+            payload = profile.to_dict()
+            payload.pop("llm_connection_id", None)
+            payload.pop("id", None)
+            exported.append(payload)
+        updated.append(agent_id)
+
+    db.session.commit()
+    body = {"updated": updated, "skipped": skipped}
+    if operation == "export":
+        body["export"] = exported
+    return jsonify(body), 200
+
+
+def _copy_agent(profile: BdvAgentProfile) -> BdvAgentProfile:
+    base, suffix = f"{profile.name} (copy)", 2
+    candidate = base
+    while _agents().find_by_name(candidate):
+        candidate = f"{profile.name} (copy {suffix})"
+        suffix += 1
+    clone = BdvAgentProfile(
+        name=candidate,
+        slug=_unique_slug(profile.slug),
+        llm_connection_id=profile.llm_connection_id,
+        persona=profile.persona,
+        system_prompt=profile.system_prompt,
+        temperature=profile.temperature,
+        max_tokens_per_match=profile.max_tokens_per_match,
+        risk_bias=profile.risk_bias,
+        is_active=profile.is_active,
+    )
+    db.session.add(clone)
+    db.session.flush()
+    return clone
+
+
+@bdv_bp.route(f"{ADMIN}/llm-connections", methods=["GET"])
+@require_auth
+@require_permission("bdv.agents.view")
+def list_llm_connections():
+    """The core adapters an agent can be bound to.
+
+    Served from here rather than read from admin-config because select options
+    in admin-config are static — a connection added in core must appear without
+    a redeploy.
+    """
+    from vbwd.models.llm_connection import LlmConnection
+
+    rows = (
+        db.session.query(LlmConnection)
+        .filter(LlmConnection.is_active.is_(True))
+        .order_by(LlmConnection.slug.asc())
+        .all()
+    )
+    return (
+        jsonify(
+            {
+                "items": [
+                    {
+                        "id": str(row.id),
+                        "slug": row.slug,
+                        "name": row.connection_name,
+                        "model": row.model,
+                    }
+                    for row in rows
+                ]
+            }
+        ),
+        200,
+    )
+
+
 # ------------------------------------------------------------ admin: matches
 
 
@@ -539,6 +795,165 @@ def create_match():
     return jsonify(match.to_dict(include_state=True)), 201
 
 
+def _plugin_config(key: str, default):
+    """Read a plugin config value, falling back when the plugin is not mounted.
+
+    The price of an agent fight is admin-configurable rather than hard-coded, so
+    it must come from here — but a missing plugin manager must not 500 a read.
+    """
+    try:
+        manager = getattr(current_app, "plugin_manager", None)
+        plugin = manager.get_plugin("bdv") if manager else None
+        if plugin is not None:
+            return plugin.get_config(key, default)
+    except Exception:
+        pass
+    return default
+
+
+@bdv_bp.route(f"{PLAY}/agents", methods=["GET"])
+@require_auth
+@require_user_permission("bdv.play")
+def playable_agents():
+    """The roster a viewer picks a fight from.
+
+    Deliberately NOT the admin payload: a system prompt is the agent's edge and
+    a connection id is infrastructure. What a viewer needs is the name, the
+    personality and the record.
+    """
+    rows, _ = _agents().list_catalogue(per_page=100, is_active=True, sort="name")
+    stats = _agents().lifetime_stats([row.id for row in rows])
+    return (
+        jsonify(
+            {
+                "items": [
+                    {
+                        "id": str(row.id),
+                        "slug": row.slug,
+                        "name": row.name,
+                        "persona": row.persona,
+                        **stats.get(
+                            str(row.id),
+                            {"games_played": 0, "net_capital": 0, "games_won": 0},
+                        ),
+                    }
+                    for row in rows
+                ],
+                "price": _plugin_config("agent_match_token_cost", 10),
+                "max_agents": _plugin_config("agent_match_max_seats", 4),
+                "balance": _token_balance(_current_user_id()),
+            }
+        ),
+        200,
+    )
+
+
+def _token_balance(user_id) -> int:
+    from vbwd.repositories.token_repository import TokenBalanceRepository
+
+    if user_id is None:
+        return 0
+    balance = TokenBalanceRepository(db.session).find_by_user_id(user_id)
+    return balance.balance if balance else 0
+
+
+@bdv_bp.route(f"{PLAY}/agent-matches", methods=["POST"])
+@require_auth
+@require_user_permission("bdv.play")
+def create_agent_match():
+    """Pay to watch a table of agents play it out.
+
+    The charge happens BEFORE the match is created and in the same transaction:
+    a fight that exists without a debit is free, and a debit without a fight is
+    theft. Tokens buy the RUN, never in-game credits — those are created at the
+    start of a match and destroyed at the end, and remain uncashable.
+    """
+    from vbwd.models.enums import TokenTransactionType
+
+    data = request.get_json(silent=True) or {}
+    board = _boards().find_by_slug(data.get("board_slug", "")) or _boards().find_by_id(
+        data.get("board_id")
+    )
+    if not board:
+        return jsonify({"error": "board not found"}), 404
+    if board.status != BOARD_STATUS_PUBLISHED:
+        return jsonify({"error": "that board is not published"}), 422
+
+    agent_ids = data.get("agent_ids") or []
+    maximum = int(_plugin_config("agent_match_max_seats", 4))
+    if not 2 <= len(agent_ids) <= maximum:
+        return jsonify({"error": f"pick between 2 and {maximum} agents"}), 422
+
+    profiles = []
+    for agent_id in agent_ids:
+        profile = _agents().find_by_id(agent_id)
+        if profile is None or not profile.is_active:
+            return jsonify({"error": "unknown or inactive agent"}), 422
+        profiles.append(profile)
+
+    user_id = _current_user_id()
+    price = int(_plugin_config("agent_match_token_cost", 10))
+    if price > 0:
+        try:
+            _token_service().debit_tokens(
+                user_id,
+                price,
+                TokenTransactionType.USAGE,
+                description="BizDevVibes agent fight",
+            )
+        except ValueError as refused:
+            return (
+                jsonify({"error": str(refused), "balance": _token_balance(user_id)}),
+                402,
+            )
+
+    service = _match_service()
+    try:
+        match = service.create(
+            board,
+            created_by=user_id,
+            seats=[
+                {
+                    "kind": SEAT_KIND_LLM,
+                    "agent_profile_id": profile.id,
+                    "display_name": profile.name,
+                }
+                for profile in profiles
+            ],
+            fill_policy=FILL_AGENTS_NOW,
+            slug=(data.get("slug") or "").strip() or None,
+        )
+        service.advance_agents(match)
+    except MatchError as rejected:
+        # The debit and the match share this transaction, so a rollback here
+        # takes the charge with it — nobody pays for a fight that never ran.
+        db.session.rollback()
+        return jsonify({"error": str(rejected)}), 422
+
+    db.session.commit()
+    payload = match.to_dict(include_state=True)
+    payload["charged"] = price
+    payload["balance"] = _token_balance(user_id)
+    return jsonify(payload), 201
+
+
+def _token_service():
+    from vbwd.repositories.token_bundle_purchase_repository import (
+        TokenBundlePurchaseRepository,
+    )
+    from vbwd.repositories.token_repository import (
+        TokenBalanceRepository,
+        TokenTransactionRepository,
+    )
+    from vbwd.services.token_service import TokenService
+
+    return TokenService(
+        TokenBalanceRepository(db.session),
+        TokenTransactionRepository(db.session),
+        TokenBundlePurchaseRepository(db.session),
+    )
+
+
 @bdv_bp.route(f"{PLAY}/matches/by-slug/<slug>", methods=["GET"])
 @require_auth
 @require_user_permission("bdv.play")
@@ -635,6 +1050,18 @@ def _authorised_seat(match):
     return seat.seat_index if seat else None
 
 
+def _may_watch(match) -> bool:
+    """Seats may act; the person who PAID for an agent fight may watch.
+
+    Without this an agents-only match 403s for its own buyer, because they hold
+    no seat in it — which is the entire point of the format.
+    """
+    if _authorised_seat(match) is not None:
+        return True
+    user_id = _current_user_id()
+    return bool(user_id and match.created_by and str(match.created_by) == str(user_id))
+
+
 @bdv_bp.route(f"{PLAY}/matches/<match_id>", methods=["GET"])
 @require_auth
 @require_user_permission("bdv.play")
@@ -642,7 +1069,7 @@ def match_detail(match_id):
     match = _matches().find_by_id(match_id)
     if not match:
         return jsonify({"error": "match not found"}), 404
-    if _authorised_seat(match) is None:
+    if not _may_watch(match):
         return jsonify({"error": "not a seat in this match"}), 403
     # Reads are where the lazy lobby deadline is applied and where agent turns
     # get played — a browser can never move an agent seat itself.
@@ -666,6 +1093,11 @@ def match_detail(match_id):
     # so the button can never be shown for a move that would be refused.
     payload["purchase_offer"] = (
         service.purchase_offer(match, seat_index) if seat_index is not None else None
+    )
+    # Whether the seat is finished, or merely short. The client must never work
+    # that out for itself — see purchase_offer.
+    payload["settlement"] = (
+        service.settlement(match, seat_index) if seat_index is not None else None
     )
     rent_deadline = service.rent_deadline(match)
     payload["rent_deadline_at"] = rent_deadline.isoformat() if rent_deadline else None
@@ -784,6 +1216,7 @@ def submit_action(match_id):
                 # a buy button for a square it has already moved off, or for one
                 # it can no longer afford.
                 "purchase_offer": service.purchase_offer(match, seat_index),
+                "settlement": service.settlement(match, seat_index),
                 # Same reason: a client that keeps a stale deadline shows no
                 # countdown on a demand raised by this very action.
                 "rent_deadline_at": (
@@ -804,7 +1237,7 @@ def match_events(match_id):
     match = _matches().find_by_id(match_id)
     if not match:
         return jsonify({"error": "match not found"}), 404
-    if _authorised_seat(match) is None:
+    if not _may_watch(match):
         return jsonify({"error": "not a seat in this match"}), 403
     try:
         since = int(request.args.get("since", -1))

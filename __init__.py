@@ -135,12 +135,22 @@ class BdvPlugin(BasePlugin):
             },
             {
                 "key": "bdv.boards.manage",
-                "label": "Manage BizDevVibes boards and agents",
+                "label": "Manage BizDevVibes boards",
                 "group": "BizDevVibes",
             },
             {
                 "key": "bdv.matches.view",
                 "label": "View BizDevVibes matches",
+                "group": "BizDevVibes",
+            },
+            {
+                "key": "bdv.agents.view",
+                "label": "View BizDevVibes agents",
+                "group": "BizDevVibes",
+            },
+            {
+                "key": "bdv.agents.manage",
+                "label": "Manage BizDevVibes agents",
                 "group": "BizDevVibes",
             },
         ]

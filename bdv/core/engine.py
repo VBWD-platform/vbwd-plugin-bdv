@@ -528,6 +528,20 @@ def _handle_end_turn(state, spec, config, action) -> ApplyResult:
 
 
 def _handle_declare_bankrupt(state, spec, config, action) -> ApplyResult:
+    """Concede — but only when the seat genuinely cannot settle.
+
+    Bankruptcy is a COMPUTED FACT, not a mood. Left unconditional, a seat facing
+    a ruinous rent bill could simply nuke itself instead of paying, denying the
+    landlord the whole point of owning the square. That is not a resignation,
+    it is a way to take money off the table, and it would quietly rewrite the
+    economics the balance harness measures.
+    """
+    if state.seat(action.seat_index).bankrupt:
+        raise IllegalActionError("that seat is already out of the match")
+    if economy.obligation_of(state, action.seat_index) <= 0:
+        raise IllegalActionError("you owe nothing — play on")
+    if economy.can_settle(state, spec, action.seat_index):
+        raise IllegalActionError("you can still cover this — sell or borrow first")
     working = _bankrupt_seat(state, action.seat_index)
     working, events = _check_match_end(working)
     if working.phase != Phase.FINISHED:

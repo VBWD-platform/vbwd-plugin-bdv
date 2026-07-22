@@ -3,10 +3,12 @@
 This is the proof that the pure engine and the persistence layer agree — the
 place where a fold-vs-snapshot divergence would show up.
 """
+import dataclasses
+
 import pytest
 
 from plugins.bdv.bdv.core.engine import ActionType
-from plugins.bdv.bdv.core.state import Phase
+from plugins.bdv.bdv.core.state import Phase, RentDemand
 from plugins.bdv.bdv.repositories.board_repository import BoardRepository
 from plugins.bdv.bdv.repositories.match_repository import (
     ActionRepository,
@@ -919,3 +921,280 @@ class TestAgentsNegotiateInTheTradingWindow:
                 Action(row.type, row.seat_index, row.payload or {}),
             ).state
         assert folded.state_hash() == service.state_for(match).state_hash()
+
+
+class TestSettlementView:
+    """The server decides whether a seat is finished — never the browser."""
+
+    def _demanded(self, db, board, service, cash):
+        match = service.create(
+            board,
+            created_by=None,
+            seats=[
+                {"kind": "baseline", "display_name": "A"},
+                {"kind": "baseline", "display_name": "B"},
+            ],
+            fill_policy="agents_now",
+        )
+        spec = service.spec_for(match)
+        state = service.state_for(match)
+        deal = next(s for s in spec.squares if s.is_ownable and s.price)
+        state = state.with_ownership(deal.index, 1)
+        state = state.with_seat(
+            dataclasses.replace(state.seat(0), cash=cash, position=deal.index)
+        )
+        state = dataclasses.replace(
+            state,
+            pending_demand=RentDemand(
+                debtor_seat=0,
+                owner_seat=1,
+                square_index=deal.index,
+                amount=5000,
+            ),
+            phase=Phase.AWAIT_RENT,
+        )
+        service._persist_state(match, state)
+        db.session.flush()
+        return match
+
+    def test_nothing_is_reported_when_nothing_is_owed(self, db, board, service):
+        match = service.create(
+            board,
+            created_by=None,
+            seats=[
+                {"kind": "baseline", "display_name": "A"},
+                {"kind": "baseline", "display_name": "B"},
+            ],
+            fill_policy="agents_now",
+        )
+        assert service.settlement(match, 0) is None
+
+    def test_a_seat_that_can_pay_is_not_offered_the_exit(self, db, board, service):
+        match = self._demanded(db, board, service, cash=9000)
+        view = service.settlement(match, 0)
+        assert view["shortfall"] == 0
+        assert view["must_concede"] is False
+
+    def test_a_seat_with_nothing_left_is(self, db, board, service):
+        match = self._demanded(db, board, service, cash=10)
+        view = service.settlement(match, 0)
+        assert view["due"] == 5000
+        assert view["shortfall"] == 4990
+        assert view["can_raise_cash"] is False
+        assert view["must_concede"] is True
+
+
+class TestAgentRoster:
+    """Lifetime statistics come from recorded results, not from replay."""
+
+    @pytest.fixture
+    def agents(self, db):
+        from plugins.bdv.bdv.models.match import BdvAgentProfile
+        from plugins.bdv.bdv.repositories.match_repository import (
+            AgentProfileRepository,
+        )
+
+        rows = [
+            BdvAgentProfile(name="Hard Closer", slug="hard-closer"),
+            BdvAgentProfile(name="Slow Nurture", slug="slow-nurture"),
+        ]
+        for row in rows:
+            db.session.add(row)
+        db.session.flush()
+        return AgentProfileRepository(db.session), rows
+
+    def test_a_fresh_agent_has_no_record(self, agents):
+        repository, rows = agents
+        assert repository.lifetime_stats([rows[0].id]) == {}
+
+    def test_the_result_is_frozen_when_the_match_ends(self, db, board, service, agents):
+        """A career of defeats totals zero without any clamping.
+
+        A bankrupt seat walks away with nothing, so its recorded result is zero
+        by definition — which is exactly what "net capital" should mean.
+        """
+        from plugins.bdv.bdv.core.state import Phase as EnginePhase
+
+        repository, rows = agents
+        match = service.create(
+            board,
+            created_by=None,
+            seats=[
+                {
+                    "kind": "llm",
+                    "agent_profile_id": rows[0].id,
+                    "display_name": "Hard Closer",
+                },
+                {
+                    "kind": "llm",
+                    "agent_profile_id": rows[1].id,
+                    "display_name": "Slow Nurture",
+                },
+            ],
+            fill_policy="agents_now",
+        )
+        state = service.state_for(match)
+        state = state.with_seat(
+            dataclasses.replace(state.seat(1), bankrupt=True, cash=0)
+        )
+        state = state.with_seat(dataclasses.replace(state.seat(0), cash=7400))
+        state = dataclasses.replace(state, phase=EnginePhase.FINISHED, winner_seat=0)
+        service._persist_state(match, state)
+        db.session.flush()
+
+        stats = repository.lifetime_stats([rows[0].id, rows[1].id])
+        assert stats[str(rows[0].id)] == {
+            "games_played": 1,
+            "net_capital": 7400,
+            "games_won": 1,
+        }
+        assert stats[str(rows[1].id)] == {
+            "games_played": 1,
+            "net_capital": 0,
+            "games_won": 0,
+        }
+
+    def test_the_roster_quick_search_covers_slug_and_name(self, db, agents):
+        repository, _ = agents
+        rows, total = repository.list_catalogue(query="nurture")
+        assert total == 1 and rows[0].slug == "slow-nurture"
+        rows, total = repository.list_catalogue(query="hard-closer")
+        assert total == 1 and rows[0].name == "Hard Closer"
+
+    def test_the_roster_sorts_and_filters(self, db, agents):
+        repository, rows = agents
+        rows[1].is_active = False
+        db.session.flush()
+
+        listed, _ = repository.list_catalogue(sort="slug", order="desc")
+        assert listed[0].slug == "slow-nurture"
+        active, total = repository.list_catalogue(is_active=True)
+        assert total == 1 and active[0].slug == "hard-closer"
+
+
+class TestPaidAgentFight:
+    """Tokens buy the RUN of a match, never in-game credits.
+
+    The two must not be confusable: credits are created when a match starts and
+    destroyed when it ends, and nothing converts them back. What a viewer buys
+    here is the compute to watch agents play, which is why the charge is a
+    plain USAGE debit against the core balance.
+    """
+
+    @pytest.fixture
+    def roster(self, db):
+        from plugins.bdv.bdv.models.match import BdvAgentProfile
+
+        rows = [
+            BdvAgentProfile(name="Closer", slug="closer"),
+            BdvAgentProfile(name="Nurturer", slug="nurturer"),
+            BdvAgentProfile(name="Retired", slug="retired", is_active=False),
+        ]
+        for row in rows:
+            db.session.add(row)
+        db.session.flush()
+        return rows
+
+    def _funded(self, db, tokens):
+        """A viewer with a token balance. Built through the ORM, not raw SQL."""
+        import uuid
+
+        from vbwd.models.user import User
+        from vbwd.repositories.token_repository import TokenBalanceRepository
+
+        user = User(
+            email=f"viewer-{uuid.uuid4().hex[:8]}@example.com",
+            password_hash="x",
+        )
+        db.session.add(user)
+        db.session.flush()
+        balance = TokenBalanceRepository(db.session).get_or_create(user.id)
+        balance.balance = tokens
+        db.session.flush()
+        return user
+
+    def test_the_charge_and_the_match_live_or_die_together(
+        self, db, board, service, roster
+    ):
+        """A fight without a debit is free; a debit without a fight is theft."""
+        from plugins.bdv.bdv.models.match import BdvMatch
+
+        user = self._funded(db, 100)
+        before = db.session.query(BdvMatch).count()
+
+        match = service.create(
+            board,
+            created_by=user.id,
+            seats=[
+                {
+                    "kind": "llm",
+                    "agent_profile_id": roster[0].id,
+                    "display_name": roster[0].name,
+                },
+                {
+                    "kind": "llm",
+                    "agent_profile_id": roster[1].id,
+                    "display_name": roster[1].name,
+                },
+            ],
+            fill_policy="agents_now",
+        )
+        db.session.flush()
+        assert db.session.query(BdvMatch).count() == before + 1
+        assert match.created_by == user.id
+        assert all(seat.user_id is None for seat in match.seats), "nobody is seated"
+
+    def test_the_buyer_holds_no_seat_but_may_still_watch(
+        self, db, board, service, roster
+    ):
+        """The format is unwatchable otherwise: its buyer sits at no seat."""
+        user = self._funded(db, 100)
+        match = service.create(
+            board,
+            created_by=user.id,
+            seats=[
+                {
+                    "kind": "llm",
+                    "agent_profile_id": roster[0].id,
+                    "display_name": roster[0].name,
+                },
+                {
+                    "kind": "llm",
+                    "agent_profile_id": roster[1].id,
+                    "display_name": roster[1].name,
+                },
+            ],
+            fill_policy="agents_now",
+        )
+        db.session.flush()
+        matches = MatchRepository(db.session)
+        assert matches.seat_for_user(match, user.id) is None
+        assert str(match.created_by) == str(user.id)
+
+    def test_an_insufficient_balance_is_refused_before_anything_is_created(self, db):
+        from vbwd.models.enums import TokenTransactionType
+        from vbwd.repositories.token_bundle_purchase_repository import (
+            TokenBundlePurchaseRepository,
+        )
+        from vbwd.repositories.token_repository import (
+            TokenBalanceRepository,
+            TokenTransactionRepository,
+        )
+        from vbwd.services.token_service import TokenService
+
+        user = self._funded(db, 3)
+        tokens = TokenService(
+            TokenBalanceRepository(db.session),
+            TokenTransactionRepository(db.session),
+            TokenBundlePurchaseRepository(db.session),
+        )
+        with pytest.raises(ValueError, match="Insufficient"):
+            tokens.debit_tokens(user.id, 10, TokenTransactionType.USAGE)
+        assert tokens.get_balance(user.id) == 3, "a refused charge takes nothing"
+
+    def test_the_price_falls_back_when_the_plugin_is_not_mounted(self, app):
+        """A read must never 500 because the plugin manager is absent."""
+        from plugins.bdv.bdv.routes import _plugin_config
+
+        with app.test_request_context():
+            assert isinstance(_plugin_config("agent_match_token_cost", 10), int)

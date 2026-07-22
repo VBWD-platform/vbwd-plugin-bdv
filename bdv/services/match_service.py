@@ -331,6 +331,34 @@ class MatchService:
             state, self.spec_for(match), state.pending_roll, seat_index
         )
 
+    def settlement(self, match: BdvMatch, seat_index: int) -> Optional[Dict]:
+        """What this seat owes and whether it can still do anything about it.
+
+        Computed server-side for the same reason prices are: the client must
+        never decide whether conceding is legal. The UI only offers "End game"
+        when the engine would actually accept it, so the button can never be a
+        dead end — and never a way out for a seat that could simply pay.
+        """
+        from ..core import economy
+
+        state = self.state_for(match)
+        if state.phase == Phase.FINISHED or state.seat(seat_index).bankrupt:
+            return None
+        obligation = economy.obligation_of(state, seat_index)
+        if obligation <= 0:
+            return None
+        spec = self.spec_for(match)
+        cash = state.seat(seat_index).cash
+        return {
+            "due": obligation,
+            "cash": cash,
+            "shortfall": max(0, obligation - cash),
+            "can_raise_cash": economy.can_raise_cash(state, spec, seat_index),
+            "liquidation_value": economy.liquidation_value(state, spec, seat_index),
+            # The only flag the UI needs: everything else is explanation.
+            "must_concede": not economy.can_settle(state, spec, seat_index),
+        }
+
     def purchase_offer(self, match: BdvMatch, seat_index: int) -> Optional[Dict]:
         """The square this seat could buy right now, or None.
 
@@ -761,7 +789,23 @@ class MatchService:
         if state.phase == Phase.FINISHED:
             match.status = MATCH_STATUS_FINISHED
             match.winner_seat_index = state.winner_seat
+            self._record_results(match, state)
         self._session.flush()
+
+    @staticmethod
+    def _record_results(match: BdvMatch, state: MatchState) -> None:
+        """Freeze each seat's result at the moment the match ends.
+
+        Lifetime agent statistics are then one GROUP BY instead of a replay of
+        every match a profile ever sat in. A bankrupt seat holds nothing, so its
+        zero is a fact rather than a special case.
+        """
+        for seat in match.seats:
+            if seat.seat_index >= len(state.seats):
+                continue
+            final = state.seat(seat.seat_index)
+            seat.final_cash = 0 if final.bankrupt else final.cash
+            seat.is_winner = seat.seat_index == state.winner_seat
 
     @staticmethod
     def _spec_payload(board) -> Dict:

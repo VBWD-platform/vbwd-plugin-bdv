@@ -452,12 +452,22 @@ class TestBankruptcyAndMatchEnd:
         result = apply(state, tiny_spec, config, Action(ActionType.DECLARE_BANKRUPT, 0))
         assert result.state.seat(0).bankrupt is True
 
+    def _broke(self, state, seat_index):
+        """Genuinely insolvent: overdrawn, owning nothing to sell.
+
+        Conceding is only legal for a seat that cannot settle, so a test cannot
+        use it as a shortcut for "remove this seat" any more.
+        """
+        return state.with_seat(dataclasses.replace(state.seat(seat_index), cash=-1))
+
     def test_last_solvent_seat_wins(self, tiny_spec, config):
         state = new_match(tiny_spec, config)
+        state = self._broke(state, 0)
         state = apply(
             state, tiny_spec, config, Action(ActionType.DECLARE_BANKRUPT, 0)
         ).state
         assert state.phase != Phase.FINISHED, "two seats still solvent"
+        state = self._broke(state, 1)
         state = apply(
             state, tiny_spec, config, Action(ActionType.DECLARE_BANKRUPT, 1)
         ).state
@@ -466,9 +476,11 @@ class TestBankruptcyAndMatchEnd:
 
     def test_no_actions_accepted_after_the_match_ends(self, tiny_spec, config):
         state = new_match(tiny_spec, config)
+        state = self._broke(state, 0)
         state = apply(
             state, tiny_spec, config, Action(ActionType.DECLARE_BANKRUPT, 0)
         ).state
+        state = self._broke(state, 1)
         state = apply(
             state, tiny_spec, config, Action(ActionType.DECLARE_BANKRUPT, 1)
         ).state

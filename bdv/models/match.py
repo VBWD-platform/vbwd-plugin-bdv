@@ -143,11 +143,16 @@ class BdvSeat(BaseModel):
         nullable=True,
     )
     display_name = db.Column(db.String(80), nullable=False)
+    #: Written ONCE, when the match finishes — see the agent-roster migration.
+    final_cash = db.Column(db.Integer, nullable=True)
+    is_winner = db.Column(db.Boolean, nullable=True)
 
     def to_dict(self) -> dict:
         return {
             "id": str(self.id),
             "seat_index": self.seat_index,
+            "final_cash": self.final_cash,
+            "is_winner": self.is_winner,
             "kind": self.kind,
             "user_id": str(self.user_id) if self.user_id else None,
             "agent_profile_id": str(self.agent_profile_id)
@@ -268,6 +273,9 @@ class BdvAgentProfile(BaseModel):
 
     __tablename__ = "bdv_agent_profile"
 
+    #: Stable handle. Names get edited; the slug is what a match, an export or a
+    #: support conversation refers to.
+    slug = db.Column(db.String(120), nullable=False, unique=True, index=True)
     name = db.Column(db.String(80), nullable=False, unique=True)
     llm_connection_id = db.Column(db.UUID(as_uuid=True), nullable=True)
     persona = db.Column(db.String(200), nullable=True)
@@ -280,7 +288,9 @@ class BdvAgentProfile(BaseModel):
     def to_dict(self) -> dict:
         return {
             "id": str(self.id),
+            "slug": self.slug,
             "name": self.name,
+            "birthday": self.created_at.isoformat() if self.created_at else None,
             "llm_connection_id": str(self.llm_connection_id)
             if self.llm_connection_id
             else None,

@@ -57,5 +57,19 @@
     "min": 2,
     "max": 6,
     "description": "Default seat count for a new match. 3 is the smallest table where the redistribution mechanic is real."
+  },
+  "agent_match_token_cost": {
+    "type": "integer",
+    "default": 10,
+    "min": 0,
+    "max": 100000,
+    "description": "VBWD tokens charged to run an agents-only match. 0 makes agent fights free."
+  },
+  "agent_match_max_seats": {
+    "type": "integer",
+    "default": 4,
+    "min": 2,
+    "max": 6,
+    "description": "How many agents a viewer may put in one fight."
   }
 }

@@ -144,8 +144,11 @@ class TestRentDemand:
 
     def test_a_demand_never_outlives_its_turn(self, owned, tiny_spec, config):
         """A later seat must never inherit a debt it did not incur."""
+        # Broke, and owning nothing to sell — conceding is only legal for a seat
+        # that genuinely cannot settle.
+        broke = owned.with_seat(dataclasses.replace(owned.seat(0), cash=0))
         state = apply(
-            owned, tiny_spec, config, Action(ActionType.DECLARE_BANKRUPT, 0)
+            broke, tiny_spec, config, Action(ActionType.DECLARE_BANKRUPT, 0)
         ).state
         assert state.pending_demand is None
 
@@ -904,3 +907,81 @@ class TestTheOwnerIsNotAPushover:
         state = self._countered(tiny_spec, config, max(1, rent - 1))
         action = BaselineSeat().next_action(state, tiny_spec, 1)
         assert action.type == ActionType.ACCEPT_RENT_OFFER
+
+
+class TestConcedingIsOnlyLegalWhenYouAreFinished:
+    """ "End game" must not double as a way to deny the landlord.
+
+    On bankruptcy every square goes back to the BANK and the demand is
+    cancelled, so a solvent seat facing a ruinous rent bill could nuke itself
+    instead of paying and the creditor would get nothing. That is not
+    resignation, it is taking money off the table.
+    """
+
+    def _demanded(self, tiny_spec, config, *, cash, owns=()):
+        state = new_match(tiny_spec, config).with_ownership(3, 1)
+        state = state.with_seat(SeatState(index=0, cash=cash, position=0))
+        for square_index in owns:
+            state = state.with_ownership(square_index, 0)
+        state = state.with_houses(3, 4)
+        state = dataclasses.replace(
+            state, pending_roll=(1, 2), phase=Phase.AWAIT_CHOICE
+        )
+        return apply(
+            state, tiny_spec, config, Action(ActionType.CHOOSE_OPTION, 0, {"steps": 3})
+        ).state
+
+    def test_a_seat_that_could_pay_in_cash_must_pay(self, tiny_spec, config):
+        state = self._demanded(tiny_spec, config, cash=99999)
+        with pytest.raises(IllegalActionError, match="still cover"):
+            apply(state, tiny_spec, config, Action(ActionType.DECLARE_BANKRUPT, 0))
+
+    def test_a_seat_with_something_left_to_sell_must_sell(self, tiny_spec, config):
+        state = self._demanded(tiny_spec, config, cash=5, owns=(1, 6))
+        assert economy.can_raise_cash(state, tiny_spec, 0) is True
+        with pytest.raises(IllegalActionError, match="sell or borrow"):
+            apply(state, tiny_spec, config, Action(ActionType.DECLARE_BANKRUPT, 0))
+
+    def test_a_seat_with_nothing_left_may_concede(self, tiny_spec, config):
+        state = self._demanded(tiny_spec, config, cash=5)
+        assert economy.can_settle(state, tiny_spec, 0) is False
+        result = apply(state, tiny_spec, config, Action(ActionType.DECLARE_BANKRUPT, 0))
+        assert result.state.seat(0).bankrupt is True
+
+    def test_a_seat_that_owes_nothing_cannot_concede(self, tiny_spec, config):
+        state = new_match(tiny_spec, config)
+        with pytest.raises(IllegalActionError, match="owe nothing"):
+            apply(state, tiny_spec, config, Action(ActionType.DECLARE_BANKRUPT, 0))
+
+    def test_a_pledged_book_is_worth_nothing_you_can_reach(self, tiny_spec, config):
+        """Book value and sellable value disagree, and only one of them pays.
+
+        Judging solvency on liquidation value alone would leave a seat unable to
+        pay, unable to sell, and unable to quit — a match that cannot end.
+        """
+        state = self._demanded(tiny_spec, config, cash=5, owns=(1,))
+        state = apply(
+            state,
+            tiny_spec,
+            config,
+            Action(ActionType.BORROW, 0, {"squares": [1], "amount": 100}),
+        ).state
+        assert economy.can_raise_cash(state, tiny_spec, 0) is False
+        result = apply(state, tiny_spec, config, Action(ActionType.DECLARE_BANKRUPT, 0))
+        assert result.state.seat(0).bankrupt is True
+
+    def test_the_ladder_and_the_guard_agree(self, tiny_spec, config):
+        """The agent's ladder and the concede guard must be one rule.
+
+        Two definitions would deadlock: an agent that can raise nothing but is
+        told it can still settle would neither pay nor quit, and the match would
+        never finish.
+        """
+        from plugins.bdv.bdv.agents.baseline import BaselineSeat
+
+        agent = BaselineSeat()
+        for cash, owns in ((5, ()), (5, (1,)), (5, (1, 6)), (99999, ())):
+            state = self._demanded(tiny_spec, config, cash=cash, owns=owns)
+            can_raise = economy.can_raise_cash(state, tiny_spec, 0)
+            ladder = agent.raise_cash_action(state, tiny_spec, 0, needed=99999)
+            assert can_raise == (ladder is not None), (cash, owns)

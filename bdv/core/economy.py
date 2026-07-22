@@ -51,6 +51,46 @@ def liquidation_value(state: MatchState, spec: BoardSpec, seat_index: int) -> in
     return total - state.debt_of(seat_index)
 
 
+def obligation_of(state: MatchState, seat_index: int) -> int:
+    """What this seat must settle right now: an outstanding demand, or an
+    overdrawn balance. Zero when it owes nothing."""
+    demand = state.pending_demand
+    if demand is not None and demand.debtor_seat == seat_index:
+        return demand.due
+    return max(0, -state.seat(seat_index).cash)
+
+
+def can_raise_cash(state: MatchState, spec: BoardSpec, seat_index: int) -> bool:
+    """Whether the solvency ladder can still produce anything at all.
+
+    Defined by what is actually SELLABLE rather than by book value, because the
+    two disagree: a fully pledged book has value but yields nothing. Borrowing
+    is not checked separately — it needs an unpledged square, and any unpledged
+    square can also simply be sold.
+    """
+    for square_index in state.owned_by(seat_index):
+        if can_sell_house(state, spec, seat_index, square_index) is None:
+            return True
+        if can_sell_square(state, spec, seat_index, square_index) is None:
+            return True
+    return False
+
+
+def can_settle(state: MatchState, spec: BoardSpec, seat_index: int) -> bool:
+    """Whether this seat can still do something about what it owes.
+
+    The line between "sell something" and "you are finished". One definition,
+    shared by the concede guard and the agents' solvency ladder — two
+    definitions would deadlock a match that could neither pay nor quit.
+    """
+    obligation = obligation_of(state, seat_index)
+    if obligation <= 0:
+        return True
+    if state.seat(seat_index).cash >= obligation:
+        return True
+    return can_raise_cash(state, spec, seat_index)
+
+
 def borrowing_power(
     state: MatchState, spec: BoardSpec, seat_index: int, loan_to_value: int
 ) -> int:

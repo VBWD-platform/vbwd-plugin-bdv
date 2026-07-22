@@ -1,7 +1,7 @@
 """Match, action, offer and agent-profile data access."""
 from typing import List, Optional, Tuple
 
-from sqlalchemy import func
+from sqlalchemy import case, func, or_
 
 from vbwd.repositories.base import BaseRepository
 
@@ -186,3 +186,79 @@ class AgentProfileRepository(BaseRepository[BdvAgentProfile]):
             .filter(BdvAgentProfile.name == name)
             .first()
         )
+
+    def find_by_slug(self, slug: str) -> Optional[BdvAgentProfile]:
+        return (
+            self._session.query(BdvAgentProfile)
+            .filter(BdvAgentProfile.slug == slug)
+            .first()
+        )
+
+    def lifetime_stats(self, profile_ids: List) -> dict:
+        """Games played and net capital per profile, in one query.
+
+        Net capital is the sum of what the agent WALKED AWAY WITH, so a career
+        of defeats totals zero without needing to be clamped: a bankrupt seat's
+        recorded result is zero by definition.
+        """
+        if not profile_ids:
+            return {}
+        rows = (
+            self._session.query(
+                BdvSeat.agent_profile_id,
+                func.count(BdvSeat.id),
+                func.coalesce(func.sum(BdvSeat.final_cash), 0),
+                func.coalesce(
+                    func.sum(case((BdvSeat.is_winner.is_(True), 1), else_=0)), 0
+                ),
+            )
+            .filter(BdvSeat.agent_profile_id.in_(profile_ids))
+            .group_by(BdvSeat.agent_profile_id)
+            .all()
+        )
+        return {
+            str(profile_id): {
+                "games_played": int(played),
+                "net_capital": int(capital),
+                "games_won": int(won),
+            }
+            for profile_id, played, capital, won in rows
+        }
+
+    def list_catalogue(
+        self,
+        *,
+        page: int = 1,
+        per_page: int = 20,
+        query: Optional[str] = None,
+        is_active: Optional[bool] = None,
+        sort: str = "name",
+        order: str = "asc",
+    ):
+        """The admin roster. Sorting on the lifetime columns happens in the
+        route, where the statistics are already joined on — sorting them here
+        would mean a second aggregate in the ORDER BY."""
+        queryset = self._session.query(BdvAgentProfile)
+        if query:
+            like = f"%{query.strip()}%"
+            queryset = queryset.filter(
+                or_(
+                    BdvAgentProfile.name.ilike(like),
+                    BdvAgentProfile.slug.ilike(like),
+                    BdvAgentProfile.persona.ilike(like),
+                )
+            )
+        if is_active is not None:
+            queryset = queryset.filter(BdvAgentProfile.is_active.is_(is_active))
+
+        column = {
+            "name": BdvAgentProfile.name,
+            "slug": BdvAgentProfile.slug,
+            "birthday": BdvAgentProfile.created_at,
+            "is_active": BdvAgentProfile.is_active,
+        }.get(sort, BdvAgentProfile.name)
+        queryset = queryset.order_by(column.desc() if order == "desc" else column.asc())
+
+        total = queryset.count()
+        rows = queryset.limit(per_page).offset((page - 1) * per_page).all()
+        return rows, total
