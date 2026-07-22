@@ -1905,3 +1905,68 @@ class TestEstateAffordances:
         row = next(r for r in service.estate(match, 0) if r["index"] == members[0])
         assert row["can_sell_house"] is False, "no houses to sell yet"
         assert row["can_sell_square"] is True
+
+
+class TestATurnWithNothingToDecideEndsItself:
+    """ "End turn" as the only available action is a click that says nothing.
+
+    Resolving offers exactly two choices — buy the square you landed on, or
+    decline it. With no purchase on offer there is no decision left, so the
+    button was pure ceremony and a wasted round-trip.
+    """
+
+    def _resolving(self, db, board, service, *, on_square):
+        """A human seat mid-resolution, standing on ``on_square``."""
+        match = service.create(
+            board,
+            created_by=None,
+            seats=[
+                {"kind": "baseline", "display_name": "A"},
+                {"kind": "baseline", "display_name": "B"},
+            ],
+            fill_policy="agents_now",
+        )
+        state = service.state_for(match)
+        state = state.with_seat(
+            dataclasses.replace(state.seat(0), position=on_square, cash=5000)
+        )
+        state = dataclasses.replace(state, phase=Phase.RESOLVING, turn_seat=0)
+        service._persist_state(match, state)
+        db.session.flush()
+        return match
+
+    def test_nothing_to_buy_ends_the_turn(self, db, board, service):
+        match = self._resolving(db, board, service, on_square=0)
+        assert service.purchase_offer(match, 0) is None, "square 0 is GO"
+        assert service.auto_end_turn(match) is True
+        assert service.state_for(match).phase != Phase.RESOLVING
+
+    def test_a_purchase_on_offer_keeps_the_turn(self, db, board, service):
+        """The one case where the click IS a decision."""
+        match = self._resolving(db, board, service, on_square=1)
+        offer = service.purchase_offer(match, 0)
+        assert offer is not None
+        assert service.auto_end_turn(match) is False
+        assert service.state_for(match).phase == Phase.RESOLVING
+
+    def test_an_outstanding_demand_keeps_the_turn(self, db, board, service):
+        """Rent outranks everything — the engine refuses end_turn anyway."""
+        match = self._resolving(db, board, service, on_square=1)
+        state = service.state_for(match)
+        state = dataclasses.replace(
+            state,
+            pending_demand=RentDemand(
+                debtor_seat=0, owner_seat=1, square_index=1, amount=100
+            ),
+        )
+        service._persist_state(match, state)
+        db.session.flush()
+        assert service.auto_end_turn(match) is False
+
+    def test_the_end_is_recorded_as_an_action(self, db, board, service):
+        """Replay must reproduce the fact, not re-derive the rule."""
+        match = self._resolving(db, board, service, on_square=0)
+        service.auto_end_turn(match)
+        db.session.flush()
+        kinds = [row.type for row in ActionRepository(db.session).for_match(match.id)]
+        assert ActionType.END_TURN in kinds

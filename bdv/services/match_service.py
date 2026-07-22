@@ -478,6 +478,37 @@ class MatchService:
             state, self.spec_for(match), state.pending_roll, seat_index
         )
 
+    def auto_end_turn(self, match: BdvMatch) -> bool:
+        """End a turn that has nothing left to decide.
+
+        Resolving offers exactly two choices: buy the square you landed on, or
+        decline it. With no purchase on offer there is no decision, and the
+        "End turn" button becomes a mandatory click that conveys nothing and
+        costs a round-trip.
+
+        An UNAFFORDABLE offer is deliberately left alone — the seat may still
+        sell or borrow and then buy, so ending the turn for them would take a
+        real option away.
+
+        Recorded as a normal action, like the turn and rent timeouts, so replay
+        reproduces the fact rather than re-deriving the rule.
+        """
+        state = self.state_for(match)
+        if state.phase != Phase.RESOLVING or state.pending_demand is not None:
+            return False
+        if self.purchase_offer(match, state.turn_seat) is not None:
+            return False
+        try:
+            self.submit(
+                match,
+                seat_index=state.turn_seat,
+                action_type=ActionType.END_TURN,
+                payload={},
+            )
+        except MatchError:
+            return False
+        return True
+
     def estate(self, match: BdvMatch, seat_index: int) -> List[Dict]:
         """Every square this seat owns, with what may actually be DONE to it.
 

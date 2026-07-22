@@ -1098,6 +1098,8 @@ def match_detail(match_id):
     service.resolve_turn_timeout(match)
     service.maybe_open_trading(match)
     service.resolve_trading_window(match)
+    # A turn with nothing left to decide ends itself — see auto_end_turn.
+    service.auto_end_turn(match)
     service.advance_agents(match)
     db.session.commit()
 
@@ -1226,6 +1228,7 @@ def submit_action(match_id):
 
     # Buying the last free square opens the trading window before anyone moves.
     service.maybe_open_trading(match)
+    service.auto_end_turn(match)
     # The agents answer in the SAME request. Without this the match sits on
     # "waiting for Agent 1" forever: a browser can never move an agent seat,
     # because the player API only lets you act on your own seat.
