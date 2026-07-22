@@ -1652,3 +1652,86 @@ class TestWatcherReadAccess:
         for view in ("submit_action", "match_offers", "resolve_offer", "start_now"):
             body = source.split(f"def {view}(")[1].split("\ndef ")[0]
             assert "_may_watch" not in body, f"{view} lets a watcher act"
+
+
+class TestChoosingYourOpponents:
+    """You pick WHO you play, by name — and may field the same agent twice.
+
+    The lobby only ever sent a seat COUNT, so every opponent was an anonymous
+    baseline. The roster exists; choosing from it is the point of having one.
+    """
+
+    @pytest.fixture
+    def roster(self, db):
+        from plugins.bdv.bdv.models.match import BdvAgentProfile
+
+        rows = [
+            BdvAgentProfile(name="Ada the Deal Hawk", slug="ada"),
+            BdvAgentProfile(name="Miles the Nurturer", slug="miles"),
+            BdvAgentProfile(name="Retired", slug="retired", is_active=False),
+        ]
+        for row in rows:
+            db.session.add(row)
+        db.session.flush()
+        return rows
+
+    def _seats_for(self, opponents):
+        """The seat list the route builds from a chosen line-up."""
+        from plugins.bdv.bdv.routes import build_opponent_seats
+
+        return build_opponent_seats(opponents)
+
+    def test_a_chosen_agent_takes_its_own_name_and_kind(self, db, roster):
+        seats = self._seats_for([{"agent_profile_id": str(roster[0].id)}])
+        assert seats[0]["display_name"] == "Ada the Deal Hawk"
+        assert seats[0]["kind"] == "llm"
+        assert seats[0]["agent_profile_id"] == roster[0].id
+
+    def test_the_same_agent_can_be_fielded_more_than_once(self, db, roster):
+        """Three copies of one personality is a legitimate table.
+
+        Numbering them is not cosmetic: the chat @-mentions seats by display
+        name, so three identical names would make the feed unreadable.
+        """
+        chosen = [{"agent_profile_id": str(roster[0].id)}] * 3
+        seats = self._seats_for(chosen)
+        names = [s["display_name"] for s in seats]
+        assert names == [
+            "Ada the Deal Hawk",
+            "Ada the Deal Hawk #2",
+            "Ada the Deal Hawk #3",
+        ]
+        assert all(s["agent_profile_id"] == roster[0].id for s in seats)
+
+    def test_different_agents_keep_their_own_names(self, db, roster):
+        seats = self._seats_for(
+            [
+                {"agent_profile_id": str(roster[0].id)},
+                {"agent_profile_id": str(roster[1].id)},
+            ]
+        )
+        assert [s["display_name"] for s in seats] == [
+            "Ada the Deal Hawk",
+            "Miles the Nurturer",
+        ]
+
+    def test_an_unknown_agent_is_refused_not_silently_swapped(self, db, roster):
+        """Substituting a baseline would hand you an opponent you did not pick."""
+        import uuid
+
+        from plugins.bdv.bdv.routes import OpponentError
+
+        with pytest.raises(OpponentError, match="unknown or inactive"):
+            self._seats_for([{"agent_profile_id": str(uuid.uuid4())}])
+
+    def test_an_inactive_agent_is_refused(self, db, roster):
+        from plugins.bdv.bdv.routes import OpponentError
+
+        with pytest.raises(OpponentError, match="unknown or inactive"):
+            self._seats_for([{"agent_profile_id": str(roster[2].id)}])
+
+    def test_an_unnamed_opponent_is_still_a_plain_baseline(self, db, roster):
+        """Not choosing is allowed — it is what the seat-count flow always did."""
+        seats = self._seats_for([{}, {}])
+        assert [s["kind"] for s in seats] == ["baseline", "baseline"]
+        assert all(s["agent_profile_id"] is None for s in seats)

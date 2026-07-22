@@ -742,17 +742,10 @@ def create_match():
             "display_name": data.get("display_name") or "You",
         }
     ]
-    for opponent in data.get("opponents") or []:
-        kind = opponent.get("kind", SEAT_KIND_BASELINE)
-        seats.append(
-            {
-                "kind": kind
-                if kind in {SEAT_KIND_LLM, SEAT_KIND_BASELINE}
-                else SEAT_KIND_BASELINE,
-                "agent_profile_id": opponent.get("agent_profile_id"),
-                "display_name": opponent.get("display_name") or "Agent",
-            }
-        )
+    try:
+        seats.extend(build_opponent_seats(data.get("opponents") or []))
+    except OpponentError as rejected:
+        return jsonify({"error": str(rejected)}), 422
     # Seats the creator did not fill: agents right away, or held OPEN for humans,
     # depending on the chosen policy.
     fill_policy = data.get("fill_policy") or FILL_AGENTS_NOW
@@ -781,6 +774,57 @@ def create_match():
         return jsonify({"error": str(rejected)}), 422
     db.session.commit()
     return jsonify(match.to_dict(include_state=True)), 201
+
+
+class OpponentError(Exception):
+    """A chosen opponent cannot be seated."""
+
+
+def build_opponent_seats(opponents) -> list:
+    """Turn a chosen line-up into seat specs.
+
+    The seat KIND and the display NAME come from the profile, never from the
+    request: a client that named its own opponent could seat an agent under
+    somebody else's identity, and the kind decides whether a model drives it.
+
+    Repeating an agent is legitimate — three copies of one personality is a real
+    table — so duplicates are numbered. That is not cosmetic: the chat @-mentions
+    seats by display name, and three identical names make the feed unreadable.
+    """
+    seats: list = []
+    used_names: Dict[str, int] = {}
+    for index, opponent in enumerate(opponents):
+        profile_id = (opponent or {}).get("agent_profile_id")
+        if not profile_id:
+            # Not choosing is allowed: that is the plain seat-count flow.
+            seats.append(
+                {
+                    "kind": SEAT_KIND_BASELINE,
+                    "agent_profile_id": None,
+                    "display_name": f"Agent {index + 1}",
+                }
+            )
+            continue
+
+        profile = _agents().find_by_id(profile_id)
+        if profile is None or not profile.is_active:
+            # Never silently substitute a baseline — that hands the player an
+            # opponent they did not choose, in a game where the opponent is the
+            # thing being chosen.
+            raise OpponentError(f"unknown or inactive agent: {profile_id}")
+
+        seen = used_names.get(profile.name, 0) + 1
+        used_names[profile.name] = seen
+        seats.append(
+            {
+                "kind": SEAT_KIND_LLM,
+                "agent_profile_id": profile.id,
+                "display_name": (
+                    profile.name if seen == 1 else f"{profile.name} #{seen}"
+                ),
+            }
+        )
+    return seats
 
 
 @bdv_bp.route(f"{PLAY}/agents", methods=["GET"])
