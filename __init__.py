@@ -8,11 +8,14 @@ the bank — it goes to the opponents, so escaping fate funds your rivals.
 Core is agnostic: this plugin adds itself only through seams core already
 exposes (blueprint, container, permission catalog, bot command provider).
 """
+import logging
 from typing import Any, Dict, Optional, TYPE_CHECKING
 
 from flask import current_app
 
 from vbwd.plugins.base import BasePlugin, PluginMetadata, PublicRouteDeclaration
+
+logger = logging.getLogger(__name__)
 
 if TYPE_CHECKING:
     from flask import Blueprint
@@ -226,6 +229,27 @@ class BdvPlugin(BasePlugin):
                 "bdv_agent_profile_repository": AgentProfileRepository,
             },
         )
+        self._register_data_exchangers()
+
+    def _register_data_exchangers(self) -> None:
+        """Put the agent roster on the core Import/Export page.
+
+        Core stays agnostic — it declares none of these — so the plugin adds its
+        exchanger on enable through the shared session. Guarded because the
+        data-exchange seam is optional: an installation without it must still
+        enable this plugin.
+        """
+        try:
+            from vbwd.extensions import db
+            from plugins.bdv.bdv.services.data_exchange.bdv_exchangers import (
+                register_bdv_exchangers,
+            )
+
+            register_bdv_exchangers(db.session)
+        except Exception as exchanger_error:  # noqa: BLE001 — optional seam
+            logger.warning(
+                "[bdv] Failed to register data exchangers: %s", exchanger_error
+            )
 
     def on_disable(self) -> None:
         from vbwd.plugins.di_helpers import unregister_repositories
@@ -243,3 +267,12 @@ class BdvPlugin(BasePlugin):
                 "bdv_agent_profile_repository",
             ],
         )
+        try:
+            from plugins.bdv.bdv.services.data_exchange.bdv_exchangers import (
+                ENTITY_KEY_BDV_AGENT,
+            )
+            from vbwd.services.data_exchange.registry import data_exchange_registry
+
+            data_exchange_registry.unregister(ENTITY_KEY_BDV_AGENT)
+        except Exception:  # noqa: BLE001 — optional seam
+            pass

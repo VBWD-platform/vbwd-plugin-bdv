@@ -8,9 +8,11 @@ from vbwd.extensions import db
 
 def populate(app=None):
     from plugins.bdv.bdv.services.access_seeder import grant_play_permission
+    from plugins.bdv.bdv.services.agent_seeder import seed_house_agents
     from plugins.bdv.bdv.services.board_seeder import seed_funnel_board
 
     board, created = seed_funnel_board(db.session)
+    agents, agents_created = seed_house_agents(db.session)
     # Player routes are RBAC-gated; grant the permission additively so a fresh
     # install is playable without an operator editing core's access levels.
     granted = grant_play_permission(db.session)
@@ -20,6 +22,11 @@ def populate(app=None):
     print(
         f"[bdv] {'created' if created else 'already present'}: "
         f"{board.slug} ({len(board.squares)} squares, {len(board.cards)} cards)"
+    )
+    print(
+        f"[bdv] house agents: {agents_created} created, "
+        f"{len(agents) - agents_created} already present "
+        f"({', '.join(a.slug for a in agents)})"
     )
     return board
 

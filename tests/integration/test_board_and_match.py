@@ -5,6 +5,7 @@ place where a fold-vs-snapshot divergence would show up.
 """
 import dataclasses
 import json
+from decimal import Decimal
 
 import pytest
 
@@ -1379,3 +1380,196 @@ class TestLlmSeatsActuallyPlay:
         )
         match = self._match(board, service, profile)
         assert service.advance_agents(match) > 0
+
+
+class TestAgentDataExchange:
+    """The roster travels through the CORE export/import machine (S46).
+
+    A bespoke JSON download was one-way and unique to this page. Going through
+    the shared exchanger means the roster gets dry-run, upsert-vs-replace, CSV,
+    NDJSON streaming and the Settings → Import/Export UI for free.
+    """
+
+    @pytest.fixture
+    def exchanger(self, db):
+        from plugins.bdv.bdv.services.data_exchange.bdv_exchangers import (
+            build_bdv_exchangers,
+        )
+
+        return build_bdv_exchangers(db.session)[0]
+
+    @pytest.fixture
+    def connection(self, db):
+        from vbwd.models.llm_connection import LlmConnection
+
+        row = LlmConnection(
+            slug="house-anthropic",
+            connection_name="House",
+            api_key="secret-key",
+            model="claude-test",
+            is_active=True,
+        )
+        db.session.add(row)
+        db.session.flush()
+        return row
+
+    @pytest.fixture
+    def agent(self, db, connection):
+        from plugins.bdv.bdv.models.match import BdvAgentProfile
+
+        row = BdvAgentProfile(
+            slug="hawk",
+            name="Hawk",
+            persona="plays the players",
+            system_prompt="Read the cash positions first.",
+            llm_connection_id=connection.id,
+            temperature="0.75",
+            risk_bias="0.55",
+        )
+        db.session.add(row)
+        db.session.flush()
+        return row
+
+    def _rows(self, exchanger):
+        from vbwd.services.data_exchange.port import ExportSelector
+
+        return exchanger.export(ExportSelector(all=True), include_pii=False).rows
+
+    def test_the_connection_travels_as_a_slug_never_an_id(self, db, exchanger, agent):
+        """An exported UUID would sometimes resolve to the WRONG connection."""
+        row = next(r for r in self._rows(exchanger) if r["slug"] == "hawk")
+        assert row["llm_connection_slug"] == "house-anthropic"
+        assert "llm_connection_id" not in row
+
+    def test_decimals_survive_the_json_round_trip(self, db, exchanger, agent):
+        row = next(r for r in self._rows(exchanger) if r["slug"] == "hawk")
+        assert row["temperature"] == "0.75"
+        json.dumps(row), "the envelope must be serialisable"
+
+    def test_an_import_rebinds_by_slug_on_the_receiving_instance(
+        self, db, exchanger, connection
+    ):
+        from plugins.bdv.bdv.models.match import BdvAgentProfile
+
+        payload = {
+            "entity": "bdv_agent_profiles",
+            "bdv_agent_profiles": [
+                {
+                    "slug": "imported",
+                    "name": "Imported One",
+                    "persona": "from another box",
+                    "system_prompt": "Play tight.",
+                    "temperature": "0.30",
+                    "risk_bias": "0.20",
+                    "max_tokens_per_match": 50000,
+                    "is_active": True,
+                    "llm_connection_slug": "house-anthropic",
+                }
+            ],
+        }
+        result = exchanger.import_(payload, mode="upsert", dry_run=False)
+        assert (result.created, result.updated) == (1, 0)
+
+        imported = (
+            db.session.query(BdvAgentProfile)
+            .filter(BdvAgentProfile.slug == "imported")
+            .first()
+        )
+        assert imported.llm_connection_id == connection.id
+        assert imported.temperature == Decimal("0.30")
+
+    def test_an_unknown_connection_lands_the_agent_unbound_not_rejected(
+        self, db, exchanger
+    ):
+        """The case this feature exists for: two boxes, different slugs.
+
+        Failing the row would throw away the persona and the prompt over a
+        binding an admin can fix in one click. An unbound agent still plays —
+        it falls back to the deterministic baseline.
+        """
+        from plugins.bdv.bdv.models.match import BdvAgentProfile
+
+        payload = {
+            "entity": "bdv_agent_profiles",
+            "bdv_agent_profiles": [
+                {
+                    "slug": "orphan",
+                    "name": "Orphan",
+                    "llm_connection_slug": "not-on-this-box",
+                }
+            ],
+        }
+        result = exchanger.import_(payload, mode="upsert", dry_run=False)
+        assert result.errors == []
+        row = (
+            db.session.query(BdvAgentProfile)
+            .filter(BdvAgentProfile.slug == "orphan")
+            .first()
+        )
+        assert row is not None and row.llm_connection_id is None
+
+    def test_a_dry_run_reports_without_writing(self, db, exchanger):
+        from plugins.bdv.bdv.models.match import BdvAgentProfile
+
+        payload = {
+            "entity": "bdv_agent_profiles",
+            "bdv_agent_profiles": [{"slug": "ghost", "name": "Ghost"}],
+        }
+        result = exchanger.import_(payload, mode="upsert", dry_run=True)
+        assert result.created == 1
+        assert (
+            db.session.query(BdvAgentProfile)
+            .filter(BdvAgentProfile.slug == "ghost")
+            .first()
+            is None
+        ), "a dry run wrote to the database"
+
+    def test_re_importing_updates_rather_than_duplicating(self, db, exchanger, agent):
+        payload = {
+            "entity": "bdv_agent_profiles",
+            "bdv_agent_profiles": [{"slug": "hawk", "name": "Hawk Renamed"}],
+        }
+        result = exchanger.import_(payload, mode="upsert", dry_run=False)
+        assert (result.created, result.updated) == (0, 1)
+        assert agent.name == "Hawk Renamed"
+
+
+class TestHouseAgents:
+    """Three agents ship with the plugin, and they differ strategically."""
+
+    def test_seeding_creates_three_and_is_idempotent(self, db):
+        from plugins.bdv.bdv.services.agent_seeder import seed_house_agents
+
+        rows, created = seed_house_agents(db.session)
+        assert (len(rows), created) == (3, 3)
+
+        again, created_again = seed_house_agents(db.session)
+        assert created_again == 0, "a re-run must never duplicate"
+        assert {r.slug for r in again} == {r.slug for r in rows}
+
+    def test_a_re_run_does_not_clobber_a_tuned_persona(self, db):
+        """An admin's edit must survive the next deploy's seed."""
+        from plugins.bdv.bdv.services.agent_seeder import seed_house_agents
+
+        rows, _ = seed_house_agents(db.session)
+        rows[0].system_prompt = "Tuned by an admin."
+        db.session.flush()
+
+        seed_house_agents(db.session)
+        assert rows[0].system_prompt == "Tuned by an admin."
+
+    def test_the_three_are_actually_different(self, db):
+        """A roster of one archetype in three costumes makes fights pointless."""
+        from plugins.bdv.bdv.services.agent_seeder import seed_house_agents
+
+        rows, _ = seed_house_agents(db.session)
+        assert len({str(r.risk_bias) for r in rows}) == 3, "same appetite for risk"
+        assert len({r.system_prompt for r in rows}) == 3
+        assert all(r.persona for r in rows)
+
+    def test_they_ship_unbound(self, db):
+        """No installation's connection slugs are knowable here."""
+        from plugins.bdv.bdv.services.agent_seeder import seed_house_agents
+
+        rows, _ = seed_house_agents(db.session)
+        assert all(r.llm_connection_id is None for r in rows)

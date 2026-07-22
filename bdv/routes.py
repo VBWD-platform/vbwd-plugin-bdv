@@ -587,11 +587,15 @@ def _apply_agent_fields(profile: BdvAgentProfile, data: Dict) -> None:
 @require_auth
 @require_permission("bdv.agents.manage")
 def bulk_agents(operation):
-    if operation not in {"copy", "delete", "deactivate", "activate", "export"}:
+    # Export deliberately absent: it lives in the CORE data-exchange machine
+    # (entity ``bdv_agent_profiles``), so there is one file format, one
+    # permission model, and a matching import. A second exporter here would
+    # drift from it the first time either side changed.
+    if operation not in {"copy", "delete", "deactivate", "activate"}:
         return jsonify({"error": "unknown bulk operation"}), 422
     ids = (request.get_json(silent=True) or {}).get("agent_ids") or []
     repository = _agents()
-    updated, skipped, exported = [], [], []
+    updated, skipped = [], []
 
     for agent_id in ids:
         profile = repository.find_by_id(agent_id)
@@ -606,21 +610,10 @@ def bulk_agents(operation):
             profile.is_active = True
         elif operation == "copy":
             _copy_agent(profile)
-        elif operation == "export":
-            # Export is READ-ONLY and deliberately drops the connection binding:
-            # a connection id is meaningless on another installation, and the
-            # slug is what a human matches on when importing.
-            payload = profile.to_dict()
-            payload.pop("llm_connection_id", None)
-            payload.pop("id", None)
-            exported.append(payload)
         updated.append(agent_id)
 
     db.session.commit()
-    body = {"updated": updated, "skipped": skipped}
-    if operation == "export":
-        body["export"] = exported
-    return jsonify(body), 200
+    return jsonify({"updated": updated, "skipped": skipped}), 200
 
 
 def _copy_agent(profile: BdvAgentProfile) -> BdvAgentProfile:
