@@ -498,3 +498,382 @@ class TestStillDeterministic:
         ).state
         state = state.with_demand(RentDemand(0, 1, 3, 120, offered=40, countered=True))
         assert MatchState.from_dict(state.to_dict()).state_hash() == state.state_hash()
+
+
+# ----------------------------------------------------------------- S146-13
+
+
+class TestPrivatisationTradingWindow:
+    """Stages do not complete by luck — this is where they get completed."""
+
+    def _all_owned(self, tiny_spec, config):
+        """Every ownable square taken: 1,3,6 to seat 0; 5 to seat 1."""
+        state = new_match(tiny_spec, config)
+        for square in tiny_spec.squares:
+            if square.is_ownable and square.price:
+                state = state.with_ownership(
+                    square.index, 0 if square.index != 5 else 1
+                )
+        return state
+
+    def test_privatisation_is_detected_only_when_everything_is_owned(
+        self, tiny_spec, config
+    ):
+        partial = new_match(tiny_spec, config).with_ownership(1, 0)
+        assert economy.board_is_privatised(partial, tiny_spec) is False
+        assert economy.board_is_privatised(
+            self._all_owned(tiny_spec, config), tiny_spec
+        )
+
+    def test_the_window_opens_and_freezes_the_turn(self, tiny_spec, config):
+        state = self._all_owned(tiny_spec, config)
+        state = apply(
+            state, tiny_spec, config, Action(ActionType.OPEN_TRADING, 0)
+        ).state
+        assert state.phase == Phase.TRADING
+
+    def test_it_cannot_open_before_the_board_is_full(self, tiny_spec, config):
+        state = new_match(tiny_spec, config).with_ownership(1, 0)
+        with pytest.raises(IllegalActionError, match="not fully owned"):
+            apply(state, tiny_spec, config, Action(ActionType.OPEN_TRADING, 0))
+
+    def test_it_fires_only_once_per_match(self, tiny_spec, config):
+        state = self._all_owned(tiny_spec, config)
+        state = apply(
+            state, tiny_spec, config, Action(ActionType.OPEN_TRADING, 0)
+        ).state
+        state = apply(
+            state, tiny_spec, config, Action(ActionType.CLOSE_TRADING, 0)
+        ).state
+        assert state.trading_done is True
+        with pytest.raises(IllegalActionError, match="already been used"):
+            apply(state, tiny_spec, config, Action(ActionType.OPEN_TRADING, 0))
+
+    def test_closing_returns_play_to_the_board(self, tiny_spec, config):
+        state = self._all_owned(tiny_spec, config)
+        state = apply(
+            state, tiny_spec, config, Action(ActionType.OPEN_TRADING, 0)
+        ).state
+        state = apply(
+            state, tiny_spec, config, Action(ActionType.CLOSE_TRADING, 0)
+        ).state
+        assert state.phase == Phase.AWAIT_ROLL
+
+    def _trading(self, tiny_spec, config):
+        state = self._all_owned(tiny_spec, config)
+        return apply(state, tiny_spec, config, Action(ActionType.OPEN_TRADING, 0)).state
+
+    def test_a_square_for_credits_swap(self, tiny_spec, config):
+        state = self._trading(tiny_spec, config)
+        total = sum(s.cash for s in state.seats)
+        result = apply(
+            state,
+            tiny_spec,
+            config,
+            Action(
+                ActionType.EXECUTE_TRADE,
+                0,
+                {
+                    "from_seat": 1,
+                    "to_seat": 0,
+                    "give_squares": [5],
+                    "give_credits": 0,
+                    "want_squares": [],
+                    "want_credits": 400,
+                },
+            ),
+        )
+        assert result.state.owner_of(5) == 0, "square changed hands"
+        assert result.state.seat(1).cash == 2000 + 400
+        assert result.state.seat(0).cash == 2000 - 400
+        assert sum(s.cash for s in result.state.seats) == total
+
+    def test_a_square_for_square_swap(self, tiny_spec, config):
+        state = self._trading(tiny_spec, config)
+        result = apply(
+            state,
+            tiny_spec,
+            config,
+            Action(
+                ActionType.EXECUTE_TRADE,
+                0,
+                {
+                    "from_seat": 0,
+                    "to_seat": 1,
+                    "give_squares": [6],
+                    "want_squares": [5],
+                },
+            ),
+        )
+        assert result.state.owner_of(6) == 1
+        assert result.state.owner_of(5) == 0
+
+    def test_trading_completes_a_stage_and_unlocks_building(self, tiny_spec, config):
+        """The whole point: after the trade you can build, before you could not."""
+        state = new_match(tiny_spec, config)
+        state = state.with_ownership(1, 0).with_ownership(3, 1)
+        for square in tiny_spec.squares:
+            if (
+                square.is_ownable
+                and square.price
+                and state.owner_of(square.index) is None
+            ):
+                state = state.with_ownership(square.index, 1)
+        assert economy.can_build(state, tiny_spec, 0, 1) is not None, "stage incomplete"
+
+        state = apply(
+            state, tiny_spec, config, Action(ActionType.OPEN_TRADING, 0)
+        ).state
+        state = apply(
+            state,
+            tiny_spec,
+            config,
+            Action(
+                ActionType.EXECUTE_TRADE,
+                0,
+                {
+                    "from_seat": 0,
+                    "to_seat": 1,
+                    "give_credits": 500,
+                    "want_squares": [3],
+                },
+            ),
+        ).state
+        state = apply(
+            state, tiny_spec, config, Action(ActionType.CLOSE_TRADING, 0)
+        ).state
+        assert economy.can_build(state, tiny_spec, 0, 1) is None, "stage now complete"
+
+    @pytest.mark.parametrize(
+        "payload,message",
+        [
+            ({"from_seat": 0, "to_seat": 0, "give_squares": [1]}, "with yourself"),
+            ({"from_seat": 0, "to_seat": 1, "give_squares": [5]}, "not theirs"),
+            ({"from_seat": 0, "to_seat": 1, "want_squares": [6]}, "not theirs"),
+            ({"from_seat": 0, "to_seat": 1, "give_credits": 99999}, "cannot cover"),
+            ({"from_seat": 0, "to_seat": 1, "want_credits": 99999}, "cannot cover"),
+        ],
+    )
+    def test_invalid_trades_are_refused(self, tiny_spec, config, payload, message):
+        state = self._trading(tiny_spec, config)
+        with pytest.raises(economy.EconomyError, match=message):
+            apply(
+                state, tiny_spec, config, Action(ActionType.EXECUTE_TRADE, 0, payload)
+            )
+
+    def test_a_built_square_cannot_be_traded(self, tiny_spec, config):
+        state = self._trading(tiny_spec, config).with_houses(1, 1)
+        with pytest.raises(economy.EconomyError, match="buildings"):
+            apply(
+                state,
+                tiny_spec,
+                config,
+                Action(
+                    ActionType.EXECUTE_TRADE,
+                    0,
+                    {"from_seat": 0, "to_seat": 1, "give_squares": [1]},
+                ),
+            )
+
+    def test_a_pledged_square_cannot_be_traded(self, tiny_spec, config):
+        state = self._trading(tiny_spec, config)
+        state = apply(
+            state,
+            tiny_spec,
+            config,
+            Action(ActionType.BORROW, 0, {"squares": [1], "amount": 50}),
+        ).state
+        with pytest.raises(economy.EconomyError, match="collateral"):
+            apply(
+                state,
+                tiny_spec,
+                config,
+                Action(
+                    ActionType.EXECUTE_TRADE,
+                    0,
+                    {"from_seat": 0, "to_seat": 1, "give_squares": [1]},
+                ),
+            )
+
+    def test_a_failed_leg_moves_nothing(self, tiny_spec, config):
+        state = self._trading(tiny_spec, config)
+        before = state.state_hash()
+        with pytest.raises(economy.EconomyError):
+            apply(
+                state,
+                tiny_spec,
+                config,
+                Action(
+                    ActionType.EXECUTE_TRADE,
+                    0,
+                    {
+                        "from_seat": 0,
+                        "to_seat": 1,
+                        "give_squares": [1],
+                        "want_credits": 99999,
+                    },
+                ),
+            )
+        assert state.state_hash() == before, "atomic: both legs or neither"
+
+    def test_trades_are_refused_outside_the_window(self, tiny_spec, config):
+        state = self._all_owned(tiny_spec, config)
+        with pytest.raises(IllegalActionError, match="not open"):
+            apply(
+                state,
+                tiny_spec,
+                config,
+                Action(
+                    ActionType.EXECUTE_TRADE,
+                    0,
+                    {"from_seat": 0, "to_seat": 1, "give_squares": [1]},
+                ),
+            )
+
+    def test_ready_marks_the_seat(self, tiny_spec, config):
+        state = self._trading(tiny_spec, config)
+        state = apply(
+            state, tiny_spec, config, Action(ActionType.TRADING_READY, 1)
+        ).state
+        assert 1 in state.trading_ready
+
+    def test_stage_needs_names_what_is_missing(self, tiny_spec, config):
+        state = new_match(tiny_spec, config).with_ownership(1, 0).with_ownership(3, 1)
+        needs = economy.stage_needs(state, tiny_spec, 0)
+        assert needs.get("lead_gen") == [
+            3
+        ], "seat 0 needs square 3 to complete lead_gen"
+
+    def test_state_round_trips_with_trading_flags(self, tiny_spec, config):
+        from plugins.bdv.bdv.core.state import MatchState
+
+        state = self._trading(tiny_spec, config)
+        state = apply(
+            state, tiny_spec, config, Action(ActionType.TRADING_READY, 1)
+        ).state
+        assert MatchState.from_dict(state.to_dict()).state_hash() == state.state_hash()
+
+
+class TestSettlingRentWithProperty:
+    """A landlord may prefer a square worth roughly the rent to a forced sale."""
+
+    def _owed(self, tiny_spec, config):
+        state = new_match(tiny_spec, config).with_ownership(3, 1).with_ownership(1, 0)
+        state = dataclasses.replace(
+            state, pending_roll=(1, 2), phase=Phase.AWAIT_CHOICE
+        )
+        return apply(
+            state, tiny_spec, config, Action(ActionType.CHOOSE_OPTION, 0, {"steps": 3})
+        ).state
+
+    def test_the_debtor_can_offer_a_square(self, tiny_spec, config):
+        state = self._owed(tiny_spec, config)
+        result = apply(
+            state,
+            tiny_spec,
+            config,
+            Action(ActionType.OFFER_RENT_PROPERTY, 0, {"square": 1}),
+        )
+        assert result.state.pending_demand.offered_square == 1
+        assert result.events[0]["type"] == "rent_property_offered"
+        assert result.events[0]["value"] == economy.square_value(tiny_spec, 1)
+
+    def test_accepting_transfers_the_square_and_clears_the_debt(
+        self, tiny_spec, config
+    ):
+        state = self._owed(tiny_spec, config)
+        cash_before = state.seat(0).cash
+        state = apply(
+            state,
+            tiny_spec,
+            config,
+            Action(ActionType.OFFER_RENT_PROPERTY, 0, {"square": 1}),
+        ).state
+        result = apply(
+            state, tiny_spec, config, Action(ActionType.ACCEPT_RENT_OFFER, 1)
+        )
+        assert result.state.owner_of(1) == 1, "square changed hands"
+        assert result.state.seat(0).cash == cash_before, "no cash moved"
+        assert result.state.pending_demand is None
+
+    def test_insisting_clears_the_property_offer_too(self, tiny_spec, config):
+        state = self._owed(tiny_spec, config)
+        state = apply(
+            state,
+            tiny_spec,
+            config,
+            Action(ActionType.OFFER_RENT_PROPERTY, 0, {"square": 1}),
+        ).state
+        state = apply(
+            state, tiny_spec, config, Action(ActionType.INSIST_ON_FULL_RENT, 1)
+        ).state
+        assert state.pending_demand.offered_square is None
+        assert state.pending_demand.due == state.pending_demand.amount
+
+    def test_you_cannot_offer_a_square_you_do_not_own(self, tiny_spec, config):
+        state = self._owed(tiny_spec, config)
+        with pytest.raises(IllegalActionError, match="not theirs"):
+            apply(
+                state,
+                tiny_spec,
+                config,
+                Action(ActionType.OFFER_RENT_PROPERTY, 0, {"square": 3}),
+            )
+
+    def test_you_cannot_offer_a_built_or_pledged_square(self, tiny_spec, config):
+        state = self._owed(tiny_spec, config).with_houses(1, 1)
+        with pytest.raises(IllegalActionError, match="buildings"):
+            apply(
+                state,
+                tiny_spec,
+                config,
+                Action(ActionType.OFFER_RENT_PROPERTY, 0, {"square": 1}),
+            )
+
+    def test_only_one_counter_of_either_kind(self, tiny_spec, config):
+        state = self._owed(tiny_spec, config)
+        state = apply(
+            state, tiny_spec, config, Action(ActionType.OFFER_RENT, 0, {"amount": 5})
+        ).state
+        with pytest.raises(IllegalActionError, match="already made a counter"):
+            apply(
+                state,
+                tiny_spec,
+                config,
+                Action(ActionType.OFFER_RENT_PROPERTY, 0, {"square": 1}),
+            )
+
+
+class TestTheOwnerIsNotAPushover:
+    """An owner that always accepts makes the negotiation pointless."""
+
+    def _countered(self, tiny_spec, config, amount):
+        state = new_match(tiny_spec, config).with_ownership(3, 1)
+        state = dataclasses.replace(
+            state, pending_roll=(1, 2), phase=Phase.AWAIT_CHOICE
+        )
+        state = apply(
+            state, tiny_spec, config, Action(ActionType.CHOOSE_OPTION, 0, {"steps": 3})
+        ).state
+        return apply(
+            state,
+            tiny_spec,
+            config,
+            Action(ActionType.OFFER_RENT, 0, {"amount": amount}),
+        ).state
+
+    def test_a_derisory_counter_is_rejected(self, tiny_spec, config):
+        from plugins.bdv.bdv.agents.baseline import BaselineSeat
+
+        state = self._countered(tiny_spec, config, 1)
+        action = BaselineSeat().next_action(state, tiny_spec, 1)
+        assert action.type == ActionType.INSIST_ON_FULL_RENT
+
+    def test_a_fair_counter_is_accepted(self, tiny_spec, config):
+        from plugins.bdv.bdv.agents.baseline import BaselineSeat
+
+        state = self._countered(tiny_spec, config, 1)
+        rent = state.pending_demand.amount
+        state = self._countered(tiny_spec, config, max(1, rent - 1))
+        action = BaselineSeat().next_action(state, tiny_spec, 1)
+        assert action.type == ActionType.ACCEPT_RENT_OFFER

@@ -653,6 +653,8 @@ def match_detail(match_id):
     # exact.
     service.resolve_rent_timeout(match)
     service.resolve_turn_timeout(match)
+    service.maybe_open_trading(match)
+    service.resolve_trading_window(match)
     service.advance_agents(match)
     db.session.commit()
 
@@ -669,6 +671,19 @@ def match_detail(match_id):
     payload["rent_deadline_at"] = rent_deadline.isoformat() if rent_deadline else None
     turn_deadline = service.turn_deadline(match)
     payload["turn_deadline_at"] = turn_deadline.isoformat() if turn_deadline else None
+
+    # What each seat still needs to complete a stage — the hint that turns a
+    # trade screen from a spreadsheet into a negotiation.
+    if service.state_for(match).phase.value == "trading":
+        from .core import economy
+
+        state = service.state_for(match)
+        spec = service.spec_for(match)
+        payload["stage_needs"] = {
+            str(seat.index): economy.stage_needs(state, spec, seat.index)
+            for seat in state.seats
+            if not seat.bankrupt
+        }
     return jsonify(payload), 200
 
 
@@ -750,6 +765,8 @@ def submit_action(match_id):
     except MatchError as rejected:
         return jsonify({"error": str(rejected)}), 422
 
+    # Buying the last free square opens the trading window before anyone moves.
+    service.maybe_open_trading(match)
     # The agents answer in the SAME request. Without this the match sits on
     # "waiting for Agent 1" forever: a browser can never move an agent seat,
     # because the player API only lets you act on your own seat.
@@ -758,7 +775,24 @@ def submit_action(match_id):
 
     state = service.state_for(match)
     return (
-        jsonify({"state_seq": state.seq, "state": state.to_dict(), "events": events}),
+        jsonify(
+            {
+                "state_seq": state.seq,
+                "state": state.to_dict(),
+                "events": events,
+                # Recomputed AFTER the action: the client must never keep showing
+                # a buy button for a square it has already moved off, or for one
+                # it can no longer afford.
+                "purchase_offer": service.purchase_offer(match, seat_index),
+                # Same reason: a client that keeps a stale deadline shows no
+                # countdown on a demand raised by this very action.
+                "rent_deadline_at": (
+                    service.rent_deadline(match).isoformat()
+                    if service.rent_deadline(match)
+                    else None
+                ),
+            }
+        ),
         200,
     )
 

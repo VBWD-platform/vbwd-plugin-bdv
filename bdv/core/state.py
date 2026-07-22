@@ -19,6 +19,8 @@ class Phase(str, Enum):
     AWAIT_CHOICE = "await_choice"
     #: A rent demand is outstanding — the debtor must agree, counter, or raise cash.
     AWAIT_RENT = "await_rent"
+    #: Every ownable square is owned — the table trades before play resumes.
+    TRADING = "trading"
     RESOLVING = "resolving"
     FINISHED = "finished"
 
@@ -48,6 +50,8 @@ class RentDemand:
     square_index: int
     amount: int
     offered: Optional[int] = None
+    #: A square offered IN LIEU of cash. The owner may take it instead.
+    offered_square: Optional[int] = None
     #: True once a counter has been made — one per demand.
     countered: bool = False
 
@@ -102,6 +106,10 @@ class MatchState:
     pending_demand: Optional[RentDemand] = None
     loans: Tuple[Loan, ...] = ()
     next_loan_id: int = 1
+    #: The privatisation trading window fires ONCE per match.
+    trading_done: bool = False
+    #: Seats that have marked themselves ready to close the window early.
+    trading_ready: Tuple[int, ...] = ()
 
     def __post_init__(self) -> None:
         # Frozen dataclass: use object.__setattr__ to normalise defaults once.
@@ -220,6 +228,8 @@ class MatchState:
             "pending_demand": _demand_payload(self.pending_demand),
             "loans": [_loan_payload(loan) for loan in self.loans],
             "next_loan_id": self.next_loan_id,
+            "trading_done": self.trading_done,
+            "trading_ready": list(self.trading_ready),
         }
         encoded = json.dumps(payload, sort_keys=True, separators=(",", ":"))
         return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
@@ -259,6 +269,8 @@ class MatchState:
                     "pending_demand": _demand_payload(self.pending_demand),
                     "loans": [_loan_payload(loan) for loan in self.loans],
                     "next_loan_id": self.next_loan_id,
+                    "trading_done": self.trading_done,
+                    "trading_ready": list(self.trading_ready),
                 }
             )
         )
@@ -297,6 +309,8 @@ class MatchState:
             pending_demand=_demand_from(payload.get("pending_demand")),
             loans=tuple(_loan_from(row) for row in payload.get("loans", [])),
             next_loan_id=payload.get("next_loan_id", 1),
+            trading_done=payload.get("trading_done", False),
+            trading_ready=tuple(payload.get("trading_ready", [])),
         )
 
 
@@ -309,6 +323,7 @@ def _demand_payload(demand: Optional[RentDemand]) -> Optional[Dict]:
         "square_index": demand.square_index,
         "amount": demand.amount,
         "offered": demand.offered,
+        "offered_square": demand.offered_square,
         "countered": demand.countered,
         "due": demand.due,
     }
@@ -323,6 +338,7 @@ def _demand_from(payload: Optional[Dict]) -> Optional[RentDemand]:
         square_index=payload["square_index"],
         amount=payload["amount"],
         offered=payload.get("offered"),
+        offered_square=payload.get("offered_square"),
         countered=payload.get("countered", False),
     )
 

@@ -256,6 +256,23 @@ class MatchService:
             state = self.state_for(match)
             if state.phase == Phase.FINISHED:
                 break
+            if state.phase == Phase.TRADING:
+                # Agents have nothing to negotiate — mark ready so a human is
+                # never left waiting out the full five minutes alone.
+                for seat_index in sorted(agent_seats):
+                    if seat_index not in state.trading_ready:
+                        try:
+                            self.submit(
+                                match,
+                                seat_index=seat_index,
+                                action_type=ActionType.TRADING_READY,
+                                payload={},
+                            )
+                            played += 1
+                        except MatchError:
+                            pass
+                self.resolve_trading_window(match)
+                break
 
             # An agent OWNER must answer a counter-offer even though the turn
             # belongs to the debtor — otherwise a human counter hangs forever.
@@ -392,6 +409,16 @@ class MatchService:
         self._persist_state(match, result.state)
         return result.state, list(result.events)
 
+    def submit_and_settle(self, match: BdvMatch, **kwargs):
+        """Submit, then run the checks that belong AFTER a state change.
+
+        Kept separate from ``submit`` so the recursive calls inside those checks
+        (trading, agents) cannot re-enter it.
+        """
+        result = self.submit(match, **kwargs)
+        self.maybe_open_trading(match)
+        return result
+
     def apply_drawn_card(self, match: BdvMatch, seat_index: int, effect: Dict):
         """Execute a drawn card's ops.
 
@@ -453,6 +480,68 @@ class MatchService:
         match.turn_deadline_at = None
         self._session.flush()
         return True
+
+    # ------------------------------------------------------- trading window
+
+    def maybe_open_trading(self, match: BdvMatch) -> bool:
+        """Open the window the moment the last ownable square is bought.
+
+        Fires once per match: re-opening it every time a square changes hands
+        would stall the game. Buildings need a complete stage, and stages do not
+        complete by luck — without this the endgame is decided by who happened
+        to land where.
+        """
+        from ..core import economy
+
+        state = self.state_for(match)
+        if state.trading_done or state.phase in (Phase.TRADING, Phase.FINISHED):
+            return False
+        if not economy.board_is_privatised(state, self.spec_for(match)):
+            return False
+        try:
+            self.submit(
+                match,
+                seat_index=state.turn_seat,
+                action_type=ActionType.OPEN_TRADING,
+                payload={},
+            )
+        except MatchError:
+            return False
+        match.turn_deadline_at = _now() + timedelta(
+            seconds=self._trading_seconds(match)
+        )
+        self._session.flush()
+        return True
+
+    def resolve_trading_window(self, match: BdvMatch) -> bool:
+        """Close on the deadline, or as soon as every solvent seat is ready."""
+        state = self.state_for(match)
+        if state.phase != Phase.TRADING:
+            return False
+
+        solvent = {s.index for s in state.seats if not s.bankrupt}
+        everyone_ready = solvent and solvent <= set(state.trading_ready)
+        expired = match.turn_deadline_at is not None and _now() >= _aware(
+            match.turn_deadline_at
+        )
+        if not (everyone_ready or expired):
+            return False
+
+        self.submit(
+            match,
+            seat_index=state.turn_seat,
+            action_type=ActionType.CLOSE_TRADING,
+            payload={},
+        )
+        self._session.flush()
+        return True
+
+    @staticmethod
+    def _trading_seconds(match: BdvMatch) -> int:
+        try:
+            return int(match.spec_snapshot["board"]["trading_window_seconds"])
+        except Exception:
+            return 300
 
     # --------------------------------------------------------- turn timeout
 
@@ -602,25 +691,36 @@ class MatchService:
         )
 
     def _persist_state(self, match: BdvMatch, state: MatchState) -> None:
-        match.state_snapshot = state.to_dict()
-        match.state_seq = state.seq
         # One deadline field, two meanings: 60s while a rent demand stands,
-        # otherwise the board's turn timeout. Re-armed whenever the phase or the
-        # seat on move changes, so a deadline always belongs to the thing it is
-        # actually timing.
-        signature = (
+        # otherwise the board's turn timeout.
+        #
+        # It is re-armed only when the thing being timed actually CHANGES,
+        # compared against the PERSISTED previous snapshot. An in-memory marker
+        # would be absent on every fresh request and silently re-arm the clock,
+        # so a countdown could never expire.
+        previous = match.state_snapshot or {}
+        was = (
+            previous.get("turn_seat"),
+            previous.get("phase"),
+            previous.get("pending_demand") is not None,
+        )
+        now_signature = (
             state.turn_seat,
             state.phase.value,
             state.pending_demand is not None,
         )
+
+        match.state_snapshot = state.to_dict()
+        match.state_seq = state.seq
+
         if state.phase == Phase.FINISHED:
             match.turn_deadline_at = None
-        elif signature != getattr(match, "_deadline_signature", None):
+        elif was != now_signature or match.turn_deadline_at is None:
             seconds = (
                 60 if state.pending_demand is not None else self._turn_seconds(match)
             )
             match.turn_deadline_at = _now() + timedelta(seconds=seconds)
-        match._deadline_signature = signature
+
         if state.phase == Phase.FINISHED:
             match.status = MATCH_STATUS_FINISHED
             match.winner_seat_index = state.winner_seat

@@ -51,6 +51,8 @@ class ActionType:
     OFFER_RENT = "offer_rent"
     ACCEPT_RENT_OFFER = "accept_rent_offer"
     INSIST_ON_FULL_RENT = "insist_on_full_rent"
+    #: Settle the debt with a square instead of cash.
+    OFFER_RENT_PROPERTY = "offer_rent_property"
     # --- solvency + assets (S146-10 / S146-11)
     BUILD_HOUSE = "build_house"
     SELL_HOUSE = "sell_house"
@@ -59,6 +61,11 @@ class ActionType:
     REPAY_LOAN = "repay_loan"
     # --- table economy (S146-12)
     TRANSFER_CREDITS = "transfer_credits"
+    # --- the privatisation trading window (S146-13)
+    OPEN_TRADING = "open_trading"
+    EXECUTE_TRADE = "execute_trade"
+    TRADING_READY = "trading_ready"
+    CLOSE_TRADING = "close_trading"
     OPEN_NEGOTIATION = "open_negotiation"
     ACCEPT_BRIBE = "accept_bribe"
     ESCROW_BRIBE = "escrow_bribe"
@@ -597,12 +604,67 @@ def _handle_offer_rent(state, spec, config, action) -> ApplyResult:
     )
 
 
+def _handle_offer_rent_property(state, spec, config, action) -> ApplyResult:
+    """Offer a SQUARE instead of cash.
+
+    A landlord who is owed 480 may well prefer a square worth roughly that —
+    especially one that completes a stage — over pushing the debtor into a
+    forced sale that destroys the value. The owner still has to accept.
+    """
+    demand = _require_demand(state)
+    if action.seat_index != demand.debtor_seat:
+        raise IllegalActionError("only the debtor may offer property")
+    if demand.countered:
+        raise IllegalActionError("you have already made a counter-offer")
+
+    square_index = int(action.payload["square"])
+    problem = economy.can_trade_square(state, spec, demand.debtor_seat, square_index)
+    if problem:
+        raise IllegalActionError(problem)
+
+    working = state.with_demand(
+        replace(demand, offered_square=square_index, countered=True)
+    ).bump()
+    return ApplyResult(
+        working,
+        (
+            {
+                "type": "rent_property_offered",
+                "seat": demand.debtor_seat,
+                "to": demand.owner_seat,
+                "square": square_index,
+                "value": economy.square_value(spec, square_index),
+                "rent": demand.amount,
+            },
+        ),
+    )
+
+
 def _handle_accept_rent_offer(state, spec, config, action) -> ApplyResult:
     demand = _require_demand(state)
     if action.seat_index != demand.owner_seat:
         raise IllegalActionError("only the owner may accept")
-    if demand.offered is None:
+    if demand.offered is None and demand.offered_square is None:
         raise IllegalActionError("there is no counter-offer to accept")
+
+    if demand.offered_square is not None:
+        # Settled in kind: the square changes hands and the debt is cleared.
+        working = state.with_ownership(demand.offered_square, demand.owner_seat)
+        working = working.with_houses(demand.offered_square, 0).with_demand(None)
+        working = replace(working, phase=Phase.RESOLVING).bump()
+        return ApplyResult(
+            working,
+            (
+                {
+                    "type": "rent_settled_in_property",
+                    "seat": demand.debtor_seat,
+                    "to": demand.owner_seat,
+                    "square": demand.offered_square,
+                    "instead_of": demand.amount,
+                },
+            ),
+        )
+
     working, event = _settle_demand(state, spec, demand)
     event["accepted_offer"] = True
     return ApplyResult(working.bump(), (event,))
@@ -613,7 +675,9 @@ def _handle_insist_on_full_rent(state, spec, config, action) -> ApplyResult:
     demand = _require_demand(state)
     if action.seat_index != demand.owner_seat:
         raise IllegalActionError("only the owner may insist")
-    working = state.with_demand(replace(demand, offered=None)).bump()
+    working = state.with_demand(
+        replace(demand, offered=None, offered_square=None)
+    ).bump()
     return ApplyResult(
         working,
         (
@@ -721,6 +785,57 @@ def _handle_transfer_credits(state, spec, config, action) -> ApplyResult:
     )
 
 
+def _handle_open_trading(state, spec, config, action) -> ApplyResult:
+    """Freeze the board for the trading window — once per match."""
+    if state.trading_done:
+        raise IllegalActionError("the trading window has already been used")
+    if not economy.board_is_privatised(state, spec):
+        raise IllegalActionError("the board is not fully owned yet")
+    working = replace(state, phase=Phase.TRADING, trading_ready=()).bump()
+    return ApplyResult(working, ({"type": "trading_opened"},))
+
+
+def _handle_execute_trade(state, spec, config, action) -> ApplyResult:
+    """Swap both legs atomically, or change nothing."""
+    if state.phase != Phase.TRADING:
+        raise IllegalActionError("trading is not open")
+    payload = action.payload
+    working, event = economy.execute_trade(
+        state,
+        spec,
+        from_seat=int(payload["from_seat"]),
+        to_seat=int(payload["to_seat"]),
+        give_squares=[int(i) for i in payload.get("give_squares", [])],
+        give_credits=int(payload.get("give_credits", 0)),
+        want_squares=[int(i) for i in payload.get("want_squares", [])],
+        want_credits=int(payload.get("want_credits", 0)),
+    )
+    return ApplyResult(working.bump(), (event,))
+
+
+def _handle_trading_ready(state, spec, config, action) -> ApplyResult:
+    """Mark a seat done. A table with nothing to trade should not wait it out."""
+    if state.phase != Phase.TRADING:
+        raise IllegalActionError("trading is not open")
+    ready = tuple(sorted(set(state.trading_ready) | {action.seat_index}))
+    working = replace(state, trading_ready=ready).bump()
+    return ApplyResult(working, ({"type": "trading_ready", "seat": action.seat_index},))
+
+
+def _handle_close_trading(state, spec, config, action) -> ApplyResult:
+    """Close the window — on the deadline, or once everyone is ready.
+
+    Recorded as an action so the 5-minute clock, which lives in the service,
+    never has to be re-derived on replay.
+    """
+    if state.phase != Phase.TRADING:
+        raise IllegalActionError("trading is not open")
+    working = replace(
+        state, phase=Phase.AWAIT_ROLL, trading_done=True, trading_ready=()
+    ).bump()
+    return ApplyResult(working, ({"type": "trading_closed"},))
+
+
 def _settle_bankruptcy(
     state: MatchState, seat_index: int, spec: Optional[BoardSpec] = None
 ) -> Tuple[MatchState, List[Dict]]:
@@ -764,7 +879,7 @@ def _check_match_end(state: MatchState) -> Tuple[MatchState, List[Dict]]:
 
 
 def _advance_turn(state: MatchState, spec: BoardSpec) -> MatchState:
-    if state.phase == Phase.FINISHED:
+    if state.phase in (Phase.FINISHED, Phase.TRADING):
         return state
     count = len(state.seats)
     next_seat = state.turn_seat
@@ -798,6 +913,7 @@ _HANDLERS = {
     ActionType.OFFER_RENT: _handle_offer_rent,
     ActionType.ACCEPT_RENT_OFFER: _handle_accept_rent_offer,
     ActionType.INSIST_ON_FULL_RENT: _handle_insist_on_full_rent,
+    ActionType.OFFER_RENT_PROPERTY: _handle_offer_rent_property,
     ActionType.BUILD_HOUSE: _handle_build_house,
     ActionType.SELL_HOUSE: _handle_sell_house,
     ActionType.SELL_SQUARE: _handle_sell_square,
@@ -807,6 +923,10 @@ _HANDLERS = {
     ActionType.ESCROW_BRIBE: _handle_escrow_bribe,
     ActionType.REFUND_BRIBE: _handle_refund_bribe,
     ActionType.TURN_AUTO_SUM: _handle_turn_auto_sum,
+    ActionType.OPEN_TRADING: _handle_open_trading,
+    ActionType.EXECUTE_TRADE: _handle_execute_trade,
+    ActionType.TRADING_READY: _handle_trading_ready,
+    ActionType.CLOSE_TRADING: _handle_close_trading,
 }
 
 

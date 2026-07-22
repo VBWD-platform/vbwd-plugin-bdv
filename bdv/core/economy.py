@@ -312,3 +312,110 @@ def seize_collateral(
         tuple(row for row in working.loans if row.seat != seat_index)
     )
     return working, events
+
+
+# ------------------------------------------------------------------- trading
+
+
+def board_is_privatised(state: MatchState, spec: BoardSpec) -> bool:
+    """True when every purchasable square has an owner.
+
+    This is the trigger for the trading window: until it is true, a seat can
+    still complete a stage by landing on what it needs, so forcing the table to
+    negotiate would be premature.
+    """
+    for square in spec.squares:
+        if square.is_ownable and square.price and state.owner_of(square.index) is None:
+            return False
+    return True
+
+
+def can_trade_square(
+    state: MatchState, spec: BoardSpec, seat_index: int, square_index: int
+) -> Optional[str]:
+    if state.owner_of(square_index) != seat_index:
+        return f"square {square_index} is not theirs to give"
+    if state.houses_on(square_index) > 0:
+        # Trading a built square would silently break the stage's even-building
+        # invariant for BOTH stages involved.
+        return f"square {square_index} has buildings — sell them first"
+    if square_index in state.pledged_squares():
+        return f"square {square_index} is pledged as collateral"
+    return None
+
+
+def execute_trade(
+    state: MatchState,
+    spec: BoardSpec,
+    *,
+    from_seat: int,
+    to_seat: int,
+    give_squares: Sequence[int],
+    give_credits: int,
+    want_squares: Sequence[int],
+    want_credits: int,
+) -> Tuple[MatchState, Dict]:
+    """Swap both legs atomically, or refuse and change nothing."""
+    if from_seat == to_seat:
+        raise EconomyError("you cannot trade with yourself")
+    if state.seat(from_seat).bankrupt or state.seat(to_seat).bankrupt:
+        raise EconomyError("that seat is out of the match")
+    if give_credits < 0 or want_credits < 0:
+        raise EconomyError("credit amounts must not be negative")
+
+    for square_index in give_squares:
+        problem = can_trade_square(state, spec, from_seat, square_index)
+        if problem:
+            raise EconomyError(problem)
+    for square_index in want_squares:
+        problem = can_trade_square(state, spec, to_seat, square_index)
+        if problem:
+            raise EconomyError(problem)
+
+    if state.seat(from_seat).cash < give_credits:
+        raise EconomyError("proposer cannot cover their side")
+    if state.seat(to_seat).cash < want_credits:
+        raise EconomyError("counterparty cannot cover their side")
+
+    working = state
+    for square_index in give_squares:
+        working = working.with_ownership(square_index, to_seat)
+    for square_index in want_squares:
+        working = working.with_ownership(square_index, from_seat)
+    if give_credits:
+        working = working.with_cash_delta(from_seat, -give_credits).with_cash_delta(
+            to_seat, give_credits
+        )
+    if want_credits:
+        working = working.with_cash_delta(to_seat, -want_credits).with_cash_delta(
+            from_seat, want_credits
+        )
+
+    return working, {
+        "type": "trade_executed",
+        "seat": from_seat,
+        "to": to_seat,
+        "gave_squares": list(give_squares),
+        "gave_credits": give_credits,
+        "got_squares": list(want_squares),
+        "got_credits": want_credits,
+    }
+
+
+def stage_needs(state: MatchState, spec: BoardSpec, seat_index: int) -> Dict[str, list]:
+    """Which squares a seat still needs to complete each stage it has a foot in.
+
+    Drives the "who needs this" hint on the trade screen — a trade screen that
+    just lists assets is a spreadsheet; one that says who needs what is a
+    negotiation.
+    """
+    needs: Dict[str, list] = {}
+    for square in spec.squares:
+        if square.kind != SquareKind.DEAL or not square.stage:
+            continue
+        members = spec.stage_members(square.stage)
+        owned = [i for i in members if state.owner_of(i) == seat_index]
+        if not owned or len(owned) == len(members):
+            continue
+        needs[square.stage] = [i for i in members if state.owner_of(i) != seat_index]
+    return needs

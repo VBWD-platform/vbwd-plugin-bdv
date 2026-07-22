@@ -136,10 +136,27 @@ class BaselineSeat:
         # A rent demand outranks everything: the turn cannot end while it stands.
         demand = state.pending_demand
         if demand is not None:
-            if seat_index == demand.owner_seat and demand.offered is not None:
-                # Boring and deterministic: take the offer rather than gamble on
-                # a forced sale that might destroy the value.
-                return Action(ActionType.ACCEPT_RENT_OFFER, seat_index)
+            if seat_index == demand.owner_seat and (
+                demand.offered is not None or demand.offered_square is not None
+            ):
+                # Deterministic, but not a pushover: a square offered in lieu is
+                # taken when it is worth at least the rent, and a cash counter
+                # only when it clears half. Otherwise insist — an owner who
+                # always caves makes the negotiation pointless.
+                if demand.offered_square is not None:
+                    value = economy.square_value(spec, demand.offered_square)
+                    return Action(
+                        ActionType.ACCEPT_RENT_OFFER
+                        if value >= demand.amount
+                        else ActionType.INSIST_ON_FULL_RENT,
+                        seat_index,
+                    )
+                return Action(
+                    ActionType.ACCEPT_RENT_OFFER
+                    if demand.offered * 2 >= demand.amount
+                    else ActionType.INSIST_ON_FULL_RENT,
+                    seat_index,
+                )
             if seat_index == demand.debtor_seat:
                 shortfall = demand.due - state.seat(seat_index).cash
                 if shortfall <= 0:
