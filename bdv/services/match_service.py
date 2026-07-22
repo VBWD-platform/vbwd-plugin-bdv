@@ -41,6 +41,7 @@ from ..models.match import (
     SEAT_KIND_OPEN,
     BdvMatch,
 )
+from . import slug as slug_service
 from .board_spec_factory import BoardSpecFactory
 
 
@@ -79,6 +80,7 @@ class MatchService:
         seed: Optional[str] = None,
         fill_policy: str = FILL_AGENTS_NOW,
         wait_minutes: Optional[int] = None,
+        slug: Optional[str] = None,
     ) -> BdvMatch:
         """Create a match.
 
@@ -109,6 +111,17 @@ class MatchService:
         if not spec.is_valid:
             raise MatchError("board does not compile to a valid spec")
 
+        # A shareable handle so a player can find the table without a UUID.
+        if slug:
+            try:
+                slug = slug_service.validate(slug)
+            except slug_service.InvalidSlugError as bad:
+                raise MatchError(str(bad)) from bad
+            if self._matches.slug_taken(slug):
+                raise MatchError(f"the slug {slug!r} is already taken")
+        else:
+            slug = slug_service.generate(self._matches.slug_taken)
+
         deadline = (
             _now() + timedelta(minutes=int(wait_minutes))
             if fill_policy == FILL_WAIT_THEN_AGENTS
@@ -117,6 +130,7 @@ class MatchService:
 
         match = BdvMatch(
             board_id=board.id,
+            slug=slug,
             status=MATCH_STATUS_LOBBY,
             seed=seed or secrets.token_hex(16),
             spec_snapshot=self._spec_payload(board),

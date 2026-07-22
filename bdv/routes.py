@@ -529,6 +529,7 @@ def create_match():
             seats=seats,
             fill_policy=fill_policy,
             wait_minutes=data.get("wait_minutes"),
+            slug=(data.get("slug") or "").strip() or None,
         )
         # If the table is already full, the agents take their turns at once.
         service.advance_agents(match)
@@ -536,6 +537,37 @@ def create_match():
         return jsonify({"error": str(rejected)}), 422
     db.session.commit()
     return jsonify(match.to_dict(include_state=True)), 201
+
+
+@bdv_bp.route(f"{PLAY}/matches/by-slug/<slug>", methods=["GET"])
+@require_auth
+@require_user_permission("bdv.play")
+def find_by_slug(slug):
+    """Find a table by its shareable handle.
+
+    Deliberately readable by ANY authenticated player, not just a seated one —
+    that is the point of a slug: you were given it so you could come and join.
+    It returns the summary only (no board spec, no state), so it leaks nothing
+    about a game in progress.
+    """
+    from .services import slug as slug_service
+
+    match = _matches().find_by_slug(slug_service.normalise(slug))
+    if not match:
+        return jsonify({"error": "no game with that slug"}), 404
+
+    service = _match_service()
+    service.resolve_lobby(match)
+    db.session.commit()
+
+    payload = match.to_dict()
+    payload["your_seat"] = _authorised_seat(match)
+    payload["can_join"] = (
+        match.status == "lobby"
+        and payload["open_seats"] > 0
+        and payload["your_seat"] is None
+    )
+    return jsonify(payload), 200
 
 
 @bdv_bp.route(f"{PLAY}/matches/open", methods=["GET"])

@@ -499,3 +499,59 @@ class TestAgentTurnDriver:
         )
         played = service.advance_agents(match, max_actions=2000)
         assert played > 20
+
+
+class TestMatchSlug:
+    """A shareable handle so a player can find a table without a UUID."""
+
+    def _seats(self):
+        return [
+            {"kind": "baseline", "display_name": "Host"},
+            {"kind": "open", "display_name": "Open 1"},
+            {"kind": "open", "display_name": "Open 2"},
+        ]
+
+    def test_a_slug_is_generated_when_none_is_given(self, db, board, service):
+        from plugins.bdv.bdv.services import slug as slug_service
+
+        match = service.create(board, created_by=None, seats=self._seats())
+        assert match.slug
+        assert slug_service.SLUG_PATTERN.match(match.slug)
+
+    def test_a_custom_slug_is_normalised_and_kept(self, db, board, service):
+        match = service.create(
+            board, created_by=None, seats=self._seats(), slug="Friday Night Game"
+        )
+        assert match.slug == "friday-night-game"
+
+    def test_slugs_are_unique(self, db, board, service):
+        from plugins.bdv.bdv.services.match_service import MatchError
+
+        service.create(board, created_by=None, seats=self._seats(), slug="taken-table")
+        with pytest.raises(MatchError, match="already taken"):
+            service.create(
+                board, created_by=None, seats=self._seats(), slug="Taken Table"
+            )
+
+    def test_an_unusable_slug_is_rejected(self, db, board, service):
+        from plugins.bdv.bdv.services.match_service import MatchError
+
+        with pytest.raises(MatchError):
+            service.create(board, created_by=None, seats=self._seats(), slug="ab")
+
+    def test_generated_slugs_do_not_collide(self, db, board, service):
+        slugs = {
+            service.create(board, created_by=None, seats=self._seats()).slug
+            for _ in range(8)
+        }
+        assert len(slugs) == 8
+
+    def test_lookup_by_slug(self, db, board, service):
+        match = service.create(
+            board, created_by=None, seats=self._seats(), slug="find-me-here"
+        )
+        found = MatchRepository(db.session).find_by_slug("find-me-here")
+        assert found is not None and found.id == match.id
+
+    def test_lookup_misses_return_none(self, db, board, service):
+        assert MatchRepository(db.session).find_by_slug("no-such-table") is None

@@ -43,6 +43,9 @@ class BdvMatch(BaseModel):
     status = db.Column(
         db.String(20), nullable=False, server_default=MATCH_STATUS_LOBBY, index=True
     )
+    # Human-shareable handle for the table: how a player finds a game without a
+    # UUID. Unique so it can be typed into "find a game".
+    slug = db.Column(db.String(60), nullable=False, unique=True, index=True)
     seed = db.Column(db.String(64), nullable=False)
     # The rules the match is played under, frozen at start: a published board may
     # later be duplicated or cosmetically edited, and a match must always replay
@@ -81,6 +84,7 @@ class BdvMatch(BaseModel):
     def to_dict(self, include_state: bool = False) -> dict:
         payload = {
             "id": str(self.id),
+            "slug": self.slug,
             "board_id": str(self.board_id),
             "status": self.status,
             "state_seq": self.state_seq,

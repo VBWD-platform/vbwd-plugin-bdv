@@ -19,6 +19,12 @@ class MatchRepository(BaseRepository[BdvMatch]):
     def __init__(self, session):
         super().__init__(session, BdvMatch)
 
+    def find_by_slug(self, slug: str) -> Optional[BdvMatch]:
+        return self._session.query(BdvMatch).filter(BdvMatch.slug == slug).first()
+
+    def slug_taken(self, slug: str) -> bool:
+        return self.find_by_slug(slug) is not None
+
     def list_for_user(
         self, user_id, *, page: int = 1, per_page: int = 20
     ) -> Tuple[List[BdvMatch], int]:
