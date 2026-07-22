@@ -196,11 +196,20 @@ class TestBribeToFate:
         )
         return state
 
-    def test_accepting_transfers_the_money_and_binds_the_turn(
+    def test_escrow_then_accept_moves_the_money_and_binds_the_turn(
         self, worked_example_spec
     ):
+        """The offer escrows up front (S146-3), so accept only credits the mover."""
         cfg = MatchConfig(seed="s", seat_count=3)
         state = self._negotiating(worked_example_spec, cfg)
+        state = apply(
+            state,
+            worked_example_spec,
+            cfg,
+            Action(ActionType.ESCROW_BRIBE, 1, {"amount": 250}),
+        ).state
+        assert state.seat(1).cash == 7750, "held out of play at offer time"
+
         result = apply(
             state,
             worked_example_spec,
@@ -208,8 +217,25 @@ class TestBribeToFate:
             Action(ActionType.ACCEPT_BRIBE, 0, {"from_seat": 1, "amount": 250}),
         )
         assert result.state.seat(0).cash == 10250
-        assert result.state.seat(1).cash == 7750
+        assert result.state.seat(1).cash == 7750, "not debited twice"
         assert result.state.has_constraint(ConstraintKind.FORCED_SUM, 0)
+
+    def test_a_declined_offer_refunds_the_escrow(self, worked_example_spec):
+        cfg = MatchConfig(seed="s", seat_count=3)
+        state = self._negotiating(worked_example_spec, cfg)
+        state = apply(
+            state,
+            worked_example_spec,
+            cfg,
+            Action(ActionType.ESCROW_BRIBE, 1, {"amount": 250}),
+        ).state
+        result = apply(
+            state,
+            worked_example_spec,
+            cfg,
+            Action(ActionType.REFUND_BRIBE, 1, {"amount": 250}),
+        )
+        assert result.state.seat(1).cash == 8000, "made whole again"
 
     def test_the_engine_enforces_the_contract_not_a_route_guard(
         self, worked_example_spec
@@ -264,15 +290,17 @@ class TestBribeToFate:
                 Action(ActionType.ACCEPT_BRIBE, 0, {"from_seat": 2, "amount": 100}),
             )
 
-    def test_payer_must_be_able_to_afford_it(self, worked_example_spec):
+    def test_you_cannot_escrow_what_you_do_not_have(self, worked_example_spec):
+        """Affordability is now checked at OFFER time — that is the point of the
+        escrow: an offer cannot evaporate before it is answered."""
         cfg = MatchConfig(seed="s", seat_count=3)
         state = self._negotiating(worked_example_spec, cfg)
-        with pytest.raises(IllegalActionError):
+        with pytest.raises(IllegalActionError, match="cannot afford"):
             apply(
                 state,
                 worked_example_spec,
                 cfg,
-                Action(ActionType.ACCEPT_BRIBE, 0, {"from_seat": 2, "amount": 99999}),
+                Action(ActionType.ESCROW_BRIBE, 2, {"amount": 99999}),
             )
 
     def test_a_seat_cannot_bribe_itself(self, worked_example_spec):

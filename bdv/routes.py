@@ -652,6 +652,7 @@ def match_detail(match_id):
     # deadline — no scheduler, and it records an explicit action so replay stays
     # exact.
     service.resolve_rent_timeout(match)
+    service.resolve_turn_timeout(match)
     service.advance_agents(match)
     db.session.commit()
 
@@ -664,8 +665,10 @@ def match_detail(match_id):
     payload["purchase_offer"] = (
         service.purchase_offer(match, seat_index) if seat_index is not None else None
     )
-    deadline = service.rent_deadline(match)
-    payload["rent_deadline_at"] = deadline.isoformat() if deadline else None
+    rent_deadline = service.rent_deadline(match)
+    payload["rent_deadline_at"] = rent_deadline.isoformat() if rent_deadline else None
+    turn_deadline = service.turn_deadline(match)
+    payload["turn_deadline_at"] = turn_deadline.isoformat() if turn_deadline else None
     return jsonify(payload), 200
 
 
@@ -877,7 +880,7 @@ def resolve_offer(offer_id, decision):
             state, events = service.accept_offer(match, offer, seat_index)
             db.session.commit()
             return jsonify({"state_seq": state.seq, "events": events}), 200
-        service.decline_offer(offer, seat_index)
+        service.decline_offer(match, offer, seat_index)
     except MatchError as rejected:
         return jsonify({"error": str(rejected)}), 422
     db.session.commit()

@@ -61,6 +61,10 @@ class ActionType:
     TRANSFER_CREDITS = "transfer_credits"
     OPEN_NEGOTIATION = "open_negotiation"
     ACCEPT_BRIBE = "accept_bribe"
+    ESCROW_BRIBE = "escrow_bribe"
+    REFUND_BRIBE = "refund_bribe"
+    #: The turn timeout, recorded as an action so replay stays exact.
+    TURN_AUTO_SUM = "turn_auto_sum"
     CHOOSE_OPTION = "choose_option"
     BUY_PROPERTY = "buy_property"
     DECLINE_PURCHASE = "decline_purchase"
@@ -163,8 +167,44 @@ def _handle_open_negotiation(state, spec, config, action) -> ApplyResult:
     )
 
 
+def _handle_escrow_bribe(state, spec, config, action) -> ApplyResult:
+    """Hold the offered amount at OFFER time.
+
+    Escrowing up front is what stops a seat offering money it no longer has by
+    the time the mover answers. The funds sit out of play until the offer is
+    accepted, declined or expires.
+    """
+    _require_phase(state, Phase.NEGOTIATE)
+    amount = int(action.payload["amount"])
+    if amount <= 0:
+        raise IllegalActionError("offer must be positive")
+    if state.seat(action.seat_index).cash < amount:
+        raise IllegalActionError("you cannot afford that offer")
+    working = state.with_cash_delta(action.seat_index, -amount).bump()
+    return ApplyResult(
+        working,
+        ({"type": "bribe_escrowed", "seat": action.seat_index, "amount": amount},),
+    )
+
+
+def _handle_refund_bribe(state, spec, config, action) -> ApplyResult:
+    """Return escrowed funds when an offer is declined or expires."""
+    amount = int(action.payload["amount"])
+    if amount <= 0:
+        raise IllegalActionError("refund must be positive")
+    working = state.with_cash_delta(action.seat_index, amount).bump()
+    return ApplyResult(
+        working,
+        ({"type": "bribe_refunded", "seat": action.seat_index, "amount": amount},),
+    )
+
+
 def _handle_accept_bribe(state, spec, config, action) -> ApplyResult:
-    """Binding: the mover takes the payment and MUST take the free sum."""
+    """Binding: the mover takes the payment and MUST take the free sum.
+
+    The money was already escrowed when the offer was made, so this only credits
+    the mover — debiting again here would take it twice.
+    """
     _require_phase(state, Phase.NEGOTIATE)
     _require_turn(state, action.seat_index)
 
@@ -174,14 +214,10 @@ def _handle_accept_bribe(state, spec, config, action) -> ApplyResult:
         raise IllegalActionError("bribe amount must be non-negative")
     if payer == action.seat_index:
         raise IllegalActionError("a seat cannot bribe itself")
-    if state.seat(payer).cash < amount:
-        raise IllegalActionError("payer cannot afford the bribe")
     if state.has_constraint(ConstraintKind.FORCED_SUM, action.seat_index):
         raise IllegalActionError("a bribe has already been accepted this turn")
 
-    next_state = state.with_cash_delta(payer, -amount).with_cash_delta(
-        action.seat_index, amount
-    )
+    next_state = state.with_cash_delta(action.seat_index, amount)
     next_state = replace(
         next_state,
         constraints=next_state.constraints
@@ -198,6 +234,29 @@ def _handle_accept_bribe(state, spec, config, action) -> ApplyResult:
                 "amount": amount,
             },
         ),
+    )
+
+
+def _handle_turn_auto_sum(state, spec, config, action) -> ApplyResult:
+    """The turn timeout: take the FREE sum.
+
+    Deliberately the existing "fate default" rather than a new concept — a
+    disconnect degrades to classic play instead of stalling the table. Like the
+    rent auto-agree, the clock lives in the service and this is the recorded
+    fact, so replay reproduces it exactly.
+    """
+    if state.pending_roll is None:
+        raise IllegalActionError("no roll pending")
+    fate = sum_option(state.pending_roll)
+    result = _handle_choose_option(
+        state,
+        spec,
+        config,
+        Action(ActionType.CHOOSE_OPTION, state.turn_seat, {"steps": fate}),
+    )
+    return ApplyResult(
+        result.state,
+        result.events + ({"type": "turn_timed_out", "seat": state.turn_seat},),
     )
 
 
@@ -745,6 +804,9 @@ _HANDLERS = {
     ActionType.BORROW: _handle_borrow,
     ActionType.REPAY_LOAN: _handle_repay_loan,
     ActionType.TRANSFER_CREDITS: _handle_transfer_credits,
+    ActionType.ESCROW_BRIBE: _handle_escrow_bribe,
+    ActionType.REFUND_BRIBE: _handle_refund_bribe,
+    ActionType.TURN_AUTO_SUM: _handle_turn_auto_sum,
 }
 
 

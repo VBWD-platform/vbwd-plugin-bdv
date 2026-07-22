@@ -27,6 +27,7 @@ from ..core.engine import (
 from ..core.pricing import evaluate_options
 from ..core.state import MatchState, Phase
 from ..models.match import (
+    OFFER_STATUS_EXPIRED,
     FILL_AGENTS_NOW,
     FILL_POLICIES,
     FILL_WAIT_THEN_AGENTS,
@@ -453,6 +454,45 @@ class MatchService:
         self._session.flush()
         return True
 
+    # --------------------------------------------------------- turn timeout
+
+    def resolve_turn_timeout(self, match: BdvMatch) -> bool:
+        """Fire the turn deadline: take the FREE sum, the existing fate default.
+
+        Like the rent timer, the clock lives HERE and the outcome is a recorded
+        action, so a replay reproduces it rather than re-deriving a deadline.
+        """
+        if match.status != MATCH_STATUS_ACTIVE or match.turn_deadline_at is None:
+            return False
+        state = self.state_for(match)
+        if state.pending_demand is not None:
+            return False  # the rent timer owns this deadline
+        if _now() < _aware(match.turn_deadline_at):
+            return False
+
+        seat_index = state.turn_seat
+        try:
+            if state.phase == Phase.AWAIT_ROLL:
+                self.submit(match, seat_index=seat_index, action_type=ActionType.ROLL)
+            elif state.phase in (Phase.NEGOTIATE, Phase.AWAIT_CHOICE):
+                self.expire_offers(match)
+                self.submit(
+                    match, seat_index=seat_index, action_type=ActionType.TURN_AUTO_SUM
+                )
+            else:
+                self.submit(
+                    match, seat_index=seat_index, action_type=ActionType.END_TURN
+                )
+        except MatchError:
+            return False
+        self._session.flush()
+        return True
+
+    def turn_deadline(self, match: BdvMatch) -> Optional[datetime]:
+        if match.turn_deadline_at is None:
+            return None
+        return _aware(match.turn_deadline_at)
+
     # -------------------------------------------------------------- offers
 
     def offer_bribe(
@@ -467,6 +507,14 @@ class MatchService:
             raise MatchError("offer amount must be positive")
         if state.seat(from_seat).cash < amount:
             raise MatchError("insufficient cash to make this offer")
+
+        # Escrow up front so the offer cannot evaporate before it is answered.
+        self.submit(
+            match,
+            seat_index=from_seat,
+            action_type=ActionType.ESCROW_BRIBE,
+            payload={"amount": amount},
+        )
         return self._offers.create(
             match_id=match.id,
             turn_seq=match.state_seq,
@@ -489,21 +537,61 @@ class MatchService:
             payload={"from_seat": offer.from_seat, "amount": offer.amount},
         )
         offer.status = OFFER_STATUS_ACCEPTED
+        # Every other open offer loses — refund what they escrowed.
         for other in self._offers.open_for_match(match.id):
+            if other.id == offer.id:
+                continue
+            self._refund(match, other)
             other.status = OFFER_STATUS_DECLINED
         self._session.flush()
         return state, events
 
-    def decline_offer(self, offer, seat_index: int):
+    def decline_offer(self, match: BdvMatch, offer, seat_index: int):
         if offer.status != OFFER_STATUS_OPEN:
             raise MatchError("offer is no longer open")
         if offer.to_seat != seat_index:
             raise MatchError("this offer is not addressed to you")
+        self._refund(match, offer)
         offer.status = OFFER_STATUS_DECLINED
         self._session.flush()
         return offer
 
+    def _refund(self, match: BdvMatch, offer) -> None:
+        self.submit(
+            match,
+            seat_index=offer.from_seat,
+            action_type=ActionType.REFUND_BRIBE,
+            payload={"amount": offer.amount},
+        )
+
+    def expire_offers(self, match: BdvMatch) -> int:
+        """Refund and close every open offer from a turn that has moved on.
+
+        An offer only makes sense for the roll it was made against; once the
+        negotiation window is gone the escrowed money must come back.
+        """
+        expired = 0
+        for offer in self._offers.open_for_match(match.id):
+            if (
+                offer.turn_seq >= match.state_seq
+                and self.state_for(match).phase == Phase.NEGOTIATE
+            ):
+                continue
+            self._refund(match, offer)
+            offer.status = OFFER_STATUS_EXPIRED
+            expired += 1
+        if expired:
+            self._session.flush()
+        return expired
+
     # -------------------------------------------------------------- helpers
+
+    @staticmethod
+    def _turn_seconds(match: BdvMatch) -> int:
+        try:
+            return int(match.spec_snapshot["board"]["turn_timeout_seconds"])
+        except Exception:
+            return 120
 
     def _config(self, match: BdvMatch) -> MatchConfig:
         return MatchConfig(
@@ -516,11 +604,23 @@ class MatchService:
     def _persist_state(self, match: BdvMatch, state: MatchState) -> None:
         match.state_snapshot = state.to_dict()
         match.state_seq = state.seq
-        # Arm the rent clock when a demand appears; clear it when it settles.
-        if state.pending_demand is None:
+        # One deadline field, two meanings: 60s while a rent demand stands,
+        # otherwise the board's turn timeout. Re-armed whenever the phase or the
+        # seat on move changes, so a deadline always belongs to the thing it is
+        # actually timing.
+        signature = (
+            state.turn_seat,
+            state.phase.value,
+            state.pending_demand is not None,
+        )
+        if state.phase == Phase.FINISHED:
             match.turn_deadline_at = None
-        elif match.turn_deadline_at is None:
-            match.turn_deadline_at = _now() + timedelta(seconds=60)
+        elif signature != getattr(match, "_deadline_signature", None):
+            seconds = (
+                60 if state.pending_demand is not None else self._turn_seconds(match)
+            )
+            match.turn_deadline_at = _now() + timedelta(seconds=seconds)
+        match._deadline_signature = signature
         if state.phase == Phase.FINISHED:
             match.status = MATCH_STATUS_FINISHED
             match.winner_seat_index = state.winner_seat

@@ -700,3 +700,137 @@ class TestRentTimeoutIsRecordedNotDerived:
         after = service.state_for(match)
         assert after.seat(demand.debtor_seat).cash == debtor_cash - demand.amount
         assert after.seat(demand.owner_seat).cash == owner_cash + demand.amount
+
+
+class TestTurnTimeout:
+    """The turn deadline takes the FREE sum — the existing fate default (S146-3)."""
+
+    def _rolled(self, db, board, service):
+        match = service.create(
+            board,
+            created_by=None,
+            seats=[
+                {"kind": "baseline", "display_name": "You"},
+                {"kind": "baseline", "display_name": "A"},
+                {"kind": "baseline", "display_name": "B"},
+            ],
+            fill_policy="agents_now",
+        )
+        service.submit(match, seat_index=0, action_type="roll")
+        return match
+
+    def test_a_deadline_is_armed_for_the_turn(self, db, board, service):
+        match = self._rolled(db, board, service)
+        assert service.turn_deadline(match) is not None
+
+    def test_the_timeout_takes_the_sum_and_is_logged(self, db, board, service):
+        from datetime import datetime, timedelta, timezone
+
+        match = self._rolled(db, board, service)
+        fate = sum(service.state_for(match).pending_roll)
+        match.turn_deadline_at = datetime.now(timezone.utc) - timedelta(seconds=1)
+        db.session.flush()
+
+        assert service.resolve_turn_timeout(match) is True
+        types = [row["type"] for row in service.events_since(match)]
+        assert "turn_auto_sum" in types, "recorded as a fact, not re-derived"
+        moved = [
+            e
+            for row in service.events_since(match)
+            for e in row["events"]
+            if e["type"] == "turn_timed_out"
+        ]
+        assert moved, "the timeout is visible in the event stream"
+        assert fate > 0
+
+    def test_the_timeout_does_not_fire_early(self, db, board, service):
+        match = self._rolled(db, board, service)
+        assert service.resolve_turn_timeout(match) is False
+
+    def test_the_rent_timer_owns_the_deadline_when_a_demand_stands(
+        self, db, board, service
+    ):
+        """Two timers, one field — the rent one must win while rent is owed."""
+        import dataclasses
+
+        from plugins.bdv.bdv.core.state import Phase
+
+        match = service.create(
+            board,
+            created_by=None,
+            seats=[
+                {"kind": "baseline", "display_name": "You"},
+                {"kind": "baseline", "display_name": "A"},
+                {"kind": "baseline", "display_name": "B"},
+            ],
+            fill_policy="agents_now",
+        )
+        state = service.state_for(match)
+        staged = state.with_ownership(1, 1)
+        staged = dataclasses.replace(
+            staged, pending_roll=(1, 1), phase=Phase.AWAIT_CHOICE
+        )
+        match.state_snapshot = staged.to_dict()
+        match.state_seq = staged.seq
+        db.session.flush()
+        service.submit(
+            match, seat_index=0, action_type="choose_option", payload={"steps": 1}
+        )
+        assert service.state_for(match).pending_demand is not None
+        assert service.resolve_turn_timeout(match) is False, "rent timer owns it"
+
+
+class TestOfferEscrow:
+    """An offer holds the money up front, and gets it back if it loses."""
+
+    def _negotiating(self, db, board, service):
+        match = service.create(
+            board,
+            created_by=None,
+            seats=[
+                {"kind": "baseline", "display_name": "You"},
+                {"kind": "baseline", "display_name": "A"},
+                {"kind": "baseline", "display_name": "B"},
+            ],
+            fill_policy="agents_now",
+        )
+        service.submit(match, seat_index=0, action_type="roll")
+        return match
+
+    def test_offering_escrows_the_amount(self, db, board, service):
+        match = self._negotiating(db, board, service)
+        before = service.state_for(match).seat(1).cash
+        service.offer_bribe(match, from_seat=1, to_seat=0, amount=300)
+        assert service.state_for(match).seat(1).cash == before - 300
+
+    def test_declining_refunds_it(self, db, board, service):
+        match = self._negotiating(db, board, service)
+        before = service.state_for(match).seat(1).cash
+        offer = service.offer_bribe(match, from_seat=1, to_seat=0, amount=300)
+        service.decline_offer(match, offer, seat_index=0)
+        assert service.state_for(match).seat(1).cash == before
+        assert offer.status == "declined"
+
+    def test_expiring_refunds_it(self, db, board, service):
+        match = self._negotiating(db, board, service)
+        before = service.state_for(match).seat(1).cash
+        service.offer_bribe(match, from_seat=1, to_seat=0, amount=300)
+        # Move the turn on; the offer belonged to the roll that has now gone.
+        service.submit(match, seat_index=0, action_type="open_negotiation")
+        assert service.expire_offers(match) == 1
+        assert service.state_for(match).seat(1).cash == before
+
+    def test_you_cannot_offer_what_you_do_not_hold(self, db, board, service):
+        from plugins.bdv.bdv.services.match_service import MatchError
+
+        match = self._negotiating(db, board, service)
+        with pytest.raises(MatchError):
+            service.offer_bribe(match, from_seat=1, to_seat=0, amount=10_000_000)
+
+    def test_accepting_one_offer_refunds_the_others(self, db, board, service):
+        match = self._negotiating(db, board, service)
+        before_two = service.state_for(match).seat(2).cash
+        winner = service.offer_bribe(match, from_seat=1, to_seat=0, amount=300)
+        service.offer_bribe(match, from_seat=2, to_seat=0, amount=200)
+        service.accept_offer(match, winner, seat_index=0)
+        assert service.state_for(match).seat(2).cash == before_two, "loser made whole"
