@@ -20,7 +20,13 @@ from .core.effects import op_descriptors, validate_effect
 from .core.engine import ActionType
 from .core.fees import available_fee_policies
 from .models.board import BOARD_STATUS_DRAFT, BOARD_STATUS_PUBLISHED, BdvBoard
-from .models.match import SEAT_KIND_BASELINE, SEAT_KIND_HUMAN, SEAT_KIND_LLM
+from .models.match import (
+    FILL_AGENTS_NOW,
+    SEAT_KIND_BASELINE,
+    SEAT_KIND_HUMAN,
+    SEAT_KIND_LLM,
+    SEAT_KIND_OPEN,
+)
 from .repositories.board_repository import BoardRepository
 from .repositories.match_repository import (
     ActionRepository,
@@ -503,18 +509,93 @@ def create_match():
                 "display_name": opponent.get("display_name") or "Agent",
             }
         )
+    # Seats the creator did not fill: agents right away, or held OPEN for humans,
+    # depending on the chosen policy.
+    fill_policy = data.get("fill_policy") or FILL_AGENTS_NOW
+    fills_now = fill_policy == FILL_AGENTS_NOW
     while len(seats) < (data.get("seats") or board.default_seats):
+        position = len(seats)
         seats.append(
-            {"kind": SEAT_KIND_BASELINE, "display_name": f"Agent {len(seats)}"}
+            {"kind": SEAT_KIND_BASELINE, "display_name": f"Agent {position}"}
+            if fills_now
+            else {"kind": SEAT_KIND_OPEN, "display_name": f"Open seat {position}"}
         )
 
+    service = _match_service()
     try:
-        match = _match_service().create(board, created_by=user_id, seats=seats)
-        _match_service().start(match)
+        match = service.create(
+            board,
+            created_by=user_id,
+            seats=seats,
+            fill_policy=fill_policy,
+            wait_minutes=data.get("wait_minutes"),
+        )
+        # If the table is already full, the agents take their turns at once.
+        service.advance_agents(match)
     except MatchError as rejected:
         return jsonify({"error": str(rejected)}), 422
     db.session.commit()
     return jsonify(match.to_dict(include_state=True)), 201
+
+
+@bdv_bp.route(f"{PLAY}/matches/open", methods=["GET"])
+@require_auth
+@require_user_permission("bdv.play")
+def open_matches():
+    """Tables still waiting for players — the join list."""
+    page, per_page = _page_args()
+    rows, total = _matches().list_open(page=page, per_page=per_page)
+    mine = _current_user_id()
+    items = [
+        row.to_dict()
+        for row in rows
+        if not any(s.user_id and str(s.user_id) == str(mine) for s in row.seats)
+    ]
+    return jsonify(paginate(items, total, page, per_page)), 200
+
+
+@bdv_bp.route(f"{PLAY}/matches/<match_id>/join", methods=["POST"])
+@require_auth
+@require_user_permission("bdv.play")
+def join_match(match_id):
+    match = _matches().find_by_id(match_id)
+    if not match:
+        return jsonify({"error": "match not found"}), 404
+    data = request.get_json(silent=True) or {}
+    service = _match_service()
+    try:
+        service.resolve_lobby(match)
+        service.join(
+            match,
+            user_id=_current_user_id(),
+            display_name=data.get("display_name") or "Player",
+        )
+        service.advance_agents(match)
+    except MatchError as rejected:
+        return jsonify({"error": str(rejected)}), 422
+    db.session.commit()
+    return jsonify(match.to_dict(include_state=True)), 200
+
+
+@bdv_bp.route(f"{PLAY}/matches/<match_id>/start-now", methods=["POST"])
+@require_auth
+@require_user_permission("bdv.play")
+def start_now(match_id):
+    """Stop waiting: fill the open seats with agents and begin."""
+    match = _matches().find_by_id(match_id)
+    if not match:
+        return jsonify({"error": "match not found"}), 404
+    if _authorised_seat(match) is None:
+        return jsonify({"error": "not a seat in this match"}), 403
+    service = _match_service()
+    try:
+        service.fill_open_seats_with_agents(match)
+        service.start(match)
+        service.advance_agents(match)
+    except MatchError as rejected:
+        return jsonify({"error": str(rejected)}), 422
+    db.session.commit()
+    return jsonify(match.to_dict(include_state=True)), 200
 
 
 def _authorised_seat(match):
@@ -531,6 +612,13 @@ def match_detail(match_id):
         return jsonify({"error": "match not found"}), 404
     if _authorised_seat(match) is None:
         return jsonify({"error": "not a seat in this match"}), 403
+    # Reads are where the lazy lobby deadline is applied and where agent turns
+    # get played — a browser can never move an agent seat itself.
+    service = _match_service()
+    service.resolve_lobby(match)
+    service.advance_agents(match)
+    db.session.commit()
+
     payload = match.to_dict(include_state=True)
     payload["spec"] = match.spec_snapshot
     payload["your_seat"] = _authorised_seat(match)
@@ -592,8 +680,9 @@ def submit_action(match_id):
     # The price is NEVER taken from the client.
     payload = {k: v for k, v in (data.get("payload") or {}).items() if k != "price"}
 
+    service = _match_service()
     try:
-        state, events = _match_service().submit(
+        state, events = service.submit(
             match,
             seat_index=seat_index,
             action_type=action_type,
@@ -614,7 +703,13 @@ def submit_action(match_id):
     except MatchError as rejected:
         return jsonify({"error": str(rejected)}), 422
 
+    # The agents answer in the SAME request. Without this the match sits on
+    # "waiting for Agent 1" forever: a browser can never move an agent seat,
+    # because the player API only lets you act on your own seat.
+    service.advance_agents(match)
     db.session.commit()
+
+    state = service.state_for(match)
     return (
         jsonify({"state_seq": state.seq, "state": state.to_dict(), "events": events}),
         200,

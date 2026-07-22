@@ -11,6 +11,7 @@ Two rules govern everything here:
 from __future__ import annotations
 
 import secrets
+from datetime import datetime, timedelta, timezone
 from typing import Dict, List, Optional, Tuple
 
 from ..core.board import BoardSpec
@@ -26,16 +27,30 @@ from ..core.engine import (
 from ..core.pricing import evaluate_options
 from ..core.state import MatchState, Phase
 from ..models.match import (
+    FILL_AGENTS_NOW,
+    FILL_POLICIES,
+    FILL_WAIT_THEN_AGENTS,
     MATCH_STATUS_ACTIVE,
     MATCH_STATUS_FINISHED,
     MATCH_STATUS_LOBBY,
     OFFER_STATUS_ACCEPTED,
     OFFER_STATUS_DECLINED,
     OFFER_STATUS_OPEN,
+    SEAT_KIND_BASELINE,
     SEAT_KIND_HUMAN,
+    SEAT_KIND_OPEN,
     BdvMatch,
 )
 from .board_spec_factory import BoardSpecFactory
+
+
+def _now() -> datetime:
+    return datetime.now(timezone.utc)
+
+
+def _aware(value: datetime) -> datetime:
+    """Postgres may hand back a naive datetime depending on the driver."""
+    return value if value.tzinfo else value.replace(tzinfo=timezone.utc)
 
 
 class MatchError(RuntimeError):
@@ -62,7 +77,22 @@ class MatchService:
         created_by,
         seats: List[Dict],
         seed: Optional[str] = None,
+        fill_policy: str = FILL_AGENTS_NOW,
+        wait_minutes: Optional[int] = None,
     ) -> BdvMatch:
+        """Create a match.
+
+        ``fill_policy`` decides what happens to seats the creator did not fill:
+
+        * ``agents_now``       — agents take them and the match starts at once;
+        * ``wait_forever``     — they stay OPEN for humans, indefinitely;
+        * ``wait_then_agents`` — open until ``wait_minutes`` elapses, then agents.
+
+        The wait is evaluated LAZILY (``resolve_lobby``) rather than by a
+        scheduler: any read or action past the deadline fills the seats. The
+        feature therefore needs no extra infrastructure, and a match nobody
+        looks at costs nothing.
+        """
         if board.status != "published":
             raise MatchError("board is not published")
         if not (board.min_seats <= len(seats) <= board.max_seats):
@@ -70,9 +100,20 @@ class MatchService:
                 f"seat count must be between {board.min_seats} and {board.max_seats}"
             )
 
+        if fill_policy not in FILL_POLICIES:
+            raise MatchError(f"unknown fill policy: {fill_policy!r}")
+        if fill_policy == FILL_WAIT_THEN_AGENTS and not wait_minutes:
+            raise MatchError("wait_then_agents requires wait_minutes")
+
         spec = BoardSpecFactory.build(board)
         if not spec.is_valid:
             raise MatchError("board does not compile to a valid spec")
+
+        deadline = (
+            _now() + timedelta(minutes=int(wait_minutes))
+            if fill_policy == FILL_WAIT_THEN_AGENTS
+            else None
+        )
 
         match = BdvMatch(
             board_id=board.id,
@@ -84,6 +125,8 @@ class MatchService:
             chance_deck_size=len(BoardSpecFactory.cards_for(board, "chance")),
             community_deck_size=len(BoardSpecFactory.cards_for(board, "community")),
             created_by=created_by,
+            fill_policy=fill_policy,
+            lobby_deadline_at=deadline,
         )
         self._session.add(match)
         self._session.flush()
@@ -100,14 +143,116 @@ class MatchService:
 
         state = new_match(spec, self._config(match))
         self._persist_state(match, state)
+
+        # A table with nobody left to wait for starts immediately.
+        if not self._open_seats(match):
+            self.start(match)
+        return match
+
+    # -------------------------------------------------------------- the lobby
+
+    @staticmethod
+    def _open_seats(match: BdvMatch) -> List:
+        return [s for s in (match.seats or []) if s.kind == SEAT_KIND_OPEN]
+
+    def join(self, match: BdvMatch, *, user_id, display_name: str):
+        """Take an open seat. Starts the match when the last one is filled."""
+        if match.status != MATCH_STATUS_LOBBY:
+            raise MatchError("match has already started")
+        if any(s.user_id and str(s.user_id) == str(user_id) for s in match.seats):
+            raise MatchError("you are already seated in this match")
+        open_seats = self._open_seats(match)
+        if not open_seats:
+            raise MatchError("no open seats")
+
+        seat = open_seats[0]
+        seat.kind = SEAT_KIND_HUMAN
+        seat.user_id = user_id
+        seat.display_name = display_name or seat.display_name
+        self._session.flush()
+
+        if not self._open_seats(match):
+            self.start(match)
+        return seat
+
+    def fill_open_seats_with_agents(self, match: BdvMatch) -> int:
+        """Convert every still-open seat into a baseline agent."""
+        filled = 0
+        for index, seat in enumerate(self._open_seats(match), start=1):
+            seat.kind = SEAT_KIND_BASELINE
+            seat.user_id = None
+            seat.agent_profile_id = None
+            seat.display_name = f"Agent {index}"
+            filled += 1
+        self._session.flush()
+        return filled
+
+    def resolve_lobby(self, match: BdvMatch) -> BdvMatch:
+        """Lazily apply the fill policy. Safe to call on every read."""
+        if match.status != MATCH_STATUS_LOBBY:
+            return match
+        if not self._open_seats(match):
+            self.start(match)
+            return match
+        deadline = match.lobby_deadline_at
+        if deadline is not None and _now() >= _aware(deadline):
+            self.fill_open_seats_with_agents(match)
+            self.start(match)
         return match
 
     def start(self, match: BdvMatch) -> BdvMatch:
+        if match.status == MATCH_STATUS_ACTIVE:
+            return match
         if match.status != MATCH_STATUS_LOBBY:
             raise MatchError("match already started")
         match.status = MATCH_STATUS_ACTIVE
         self._session.flush()
         return match
+
+    # --------------------------------------------------------- the turn driver
+
+    def advance_agents(self, match: BdvMatch, max_actions: int = 400) -> int:
+        """Play every consecutive agent turn until a human is on move.
+
+        This is what makes a mixed table playable at all. The player API only
+        ever lets the authenticated user act on their OWN seat (the seat rule),
+        so nothing in a browser can move an agent — without this the match sits
+        forever on "waiting for Agent 1".
+
+        Rather than require a scheduler, the server plays the agents inline
+        whenever it is asked to: after any human action, and on read. Every
+        agent move goes through ``submit`` like any other, so it lands in the
+        same append-only log and replays identically.
+        """
+        from ..agents.baseline import BaselineSeat
+
+        if match.status != MATCH_STATUS_ACTIVE:
+            return 0
+
+        agent_kinds = {SEAT_KIND_BASELINE, "llm"}
+        agent_seats = {s.seat_index for s in match.seats if s.kind in agent_kinds}
+        if not agent_seats:
+            return 0
+
+        spec = self.spec_for(match)
+        agent = BaselineSeat()
+        played = 0
+        for _ in range(max_actions):
+            state = self.state_for(match)
+            if state.phase == Phase.FINISHED or state.turn_seat not in agent_seats:
+                break
+            action = agent.next_action(state, spec, state.turn_seat)
+            try:
+                self.submit(
+                    match,
+                    seat_index=action.seat_index,
+                    action_type=action.type,
+                    payload=dict(action.payload),
+                )
+            except MatchError:
+                break
+            played += 1
+        return played
 
     # ------------------------------------------------------------- reading
 

@@ -272,3 +272,230 @@ class TestMyMatchesList:
 
         rows, total = MatchRepository(db.session).list_for_user(uuid4())
         assert (rows, total) == ([], 0)
+
+
+class TestOpponentFillPolicy:
+    """A creator chooses what happens to seats they did not fill."""
+
+    def _seats(self, count=3):
+        # The host seat is a baseline agent here purely to keep the fixture free
+        # of user rows — a `human` seat with a NULL user_id is correctly refused
+        # by ck_bdv_seat_one_occupant.
+        return [{"kind": "baseline", "display_name": "Host"}] + [
+            {"kind": "open", "display_name": f"Open {i}"} for i in range(1, count)
+        ]
+
+    def test_agents_now_starts_immediately(self, db, board, service):
+        match = service.create(
+            board,
+            created_by=None,
+            seats=[
+                {"kind": "baseline", "display_name": "You"},
+                {"kind": "baseline", "display_name": "A"},
+                {"kind": "baseline", "display_name": "B"},
+            ],
+            fill_policy="agents_now",
+        )
+        assert match.status == "active", "no open seats — nothing to wait for"
+
+    def test_wait_forever_holds_the_lobby(self, db, board, service):
+        match = service.create(
+            board, created_by=None, seats=self._seats(), fill_policy="wait_forever"
+        )
+        assert match.status == "lobby"
+        assert match.lobby_deadline_at is None
+        # Resolving repeatedly must never auto-start it.
+        for _ in range(3):
+            service.resolve_lobby(match)
+        assert match.status == "lobby"
+
+    def test_wait_then_agents_requires_minutes(self, db, board, service):
+        from plugins.bdv.bdv.services.match_service import MatchError
+
+        with pytest.raises(MatchError):
+            service.create(
+                board,
+                created_by=None,
+                seats=self._seats(),
+                fill_policy="wait_then_agents",
+            )
+
+    def test_wait_then_agents_sets_a_deadline_and_waits(self, db, board, service):
+        match = service.create(
+            board,
+            created_by=None,
+            seats=self._seats(),
+            fill_policy="wait_then_agents",
+            wait_minutes=10,
+        )
+        assert match.status == "lobby"
+        assert match.lobby_deadline_at is not None
+        service.resolve_lobby(match)
+        assert match.status == "lobby", "deadline has not passed yet"
+
+    def test_deadline_passing_fills_with_agents_and_starts(self, db, board, service):
+        from datetime import datetime, timedelta, timezone
+
+        match = service.create(
+            board,
+            created_by=None,
+            seats=self._seats(),
+            fill_policy="wait_then_agents",
+            wait_minutes=5,
+        )
+        match.lobby_deadline_at = datetime.now(timezone.utc) - timedelta(seconds=1)
+        db.session.flush()
+
+        service.resolve_lobby(match)
+        assert match.status == "active"
+        assert not [s for s in match.seats if s.kind == "open"]
+        # host was already a baseline in this fixture + the 2 filled seats
+        assert sum(1 for s in match.seats if s.kind == "baseline") == 3
+
+    def test_unknown_policy_is_rejected(self, db, board, service):
+        from plugins.bdv.bdv.services.match_service import MatchError
+
+        with pytest.raises(MatchError):
+            service.create(
+                board, created_by=None, seats=self._seats(), fill_policy="whenever"
+            )
+
+
+class TestJoiningAnOpenSeat:
+    def _waiting_match(self, service, board):
+        return service.create(
+            board,
+            created_by=None,
+            seats=[
+                {"kind": "baseline", "display_name": "Host"},
+                {"kind": "open", "display_name": "Open 1"},
+                {"kind": "open", "display_name": "Open 2"},
+            ],
+            fill_policy="wait_forever",
+        )
+
+    def _user(self, db):
+        from uuid import uuid4
+
+        from vbwd.models.user import User
+
+        user = User(
+            id=uuid4(), email=f"p-{uuid4().hex[:8]}@example.com", password_hash="x"
+        )
+        db.session.add(user)
+        db.session.flush()
+        return user
+
+    def test_joining_takes_a_seat(self, db, board, service):
+        match = self._waiting_match(service, board)
+        user = self._user(db)
+        seat = service.join(match, user_id=user.id, display_name="Anna")
+        assert seat.kind == "human" and seat.display_name == "Anna"
+        assert match.status == "lobby", "one seat still open"
+
+    def test_filling_the_last_seat_starts_the_match(self, db, board, service):
+        match = self._waiting_match(service, board)
+        service.join(match, user_id=self._user(db).id, display_name="Anna")
+        service.join(match, user_id=self._user(db).id, display_name="Boris")
+        assert match.status == "active"
+
+    def test_cannot_join_twice(self, db, board, service):
+        from plugins.bdv.bdv.services.match_service import MatchError
+
+        match = self._waiting_match(service, board)
+        user = self._user(db)
+        service.join(match, user_id=user.id, display_name="Anna")
+        with pytest.raises(MatchError):
+            service.join(match, user_id=user.id, display_name="Anna again")
+
+    def test_cannot_join_a_started_match(self, db, board, service):
+        from plugins.bdv.bdv.services.match_service import MatchError
+
+        match = self._waiting_match(service, board)
+        service.fill_open_seats_with_agents(match)
+        service.start(match)
+        with pytest.raises(MatchError):
+            service.join(match, user_id=self._user(db).id, display_name="Late")
+
+
+class TestAgentTurnDriver:
+    """The fix for 'Waiting for Agent 1' — agents must move by themselves."""
+
+    def _mixed(self, db, service, board):
+        from uuid import uuid4
+
+        from vbwd.models.user import User
+
+        user = User(
+            id=uuid4(), email=f"h-{uuid4().hex[:8]}@example.com", password_hash="x"
+        )
+        db.session.add(user)
+        db.session.flush()
+        match = service.create(
+            board,
+            created_by=user.id,
+            seats=[
+                {"kind": "human", "user_id": user.id, "display_name": "You"},
+                {"kind": "baseline", "display_name": "Agent 1"},
+                {"kind": "baseline", "display_name": "Agent 2"},
+            ],
+            fill_policy="agents_now",
+        )
+        return match
+
+    def test_advancing_returns_the_turn_to_the_human(self, db, board, service):
+        match = self._mixed(db, service, board)
+        # Human plays a full turn.
+        service.submit(match, seat_index=0, action_type="roll")
+        service.submit(match, seat_index=0, action_type="open_negotiation")
+        state = service.state_for(match)
+        steps = sum(state.pending_roll)
+        service.submit(
+            match, seat_index=0, action_type="choose_option", payload={"steps": steps}
+        )
+        service.submit(match, seat_index=0, action_type="end_turn")
+
+        assert service.state_for(match).turn_seat == 1, "agent is on move"
+        played = service.advance_agents(match)
+        assert played > 0
+        assert service.state_for(match).turn_seat == 0, "turn came back to the human"
+
+    def test_advance_is_a_no_op_when_a_human_is_on_move(self, db, board, service):
+        match = self._mixed(db, service, board)
+        assert service.advance_agents(match) == 0
+
+    def test_agent_moves_land_in_the_same_action_log(self, db, board, service):
+        match = self._mixed(db, service, board)
+        service.submit(match, seat_index=0, action_type="roll")
+        service.submit(match, seat_index=0, action_type="open_negotiation")
+        state = service.state_for(match)
+        service.submit(
+            match,
+            seat_index=0,
+            action_type="choose_option",
+            payload={"steps": sum(state.pending_roll)},
+        )
+        service.submit(match, seat_index=0, action_type="end_turn")
+        service.advance_agents(match)
+
+        rows = service.events_since(match)
+        assert any(r["seat_index"] != 0 for r in rows), "agents appear in the log"
+        # And the log still folds to the snapshot.
+        assert (
+            service.rebuild_state(match).state_hash()
+            == service.state_for(match).state_hash()
+        )
+
+    def test_an_all_agent_table_plays_itself_to_a_conclusion(self, db, board, service):
+        match = service.create(
+            board,
+            created_by=None,
+            seats=[
+                {"kind": "baseline", "display_name": "A"},
+                {"kind": "baseline", "display_name": "B"},
+                {"kind": "baseline", "display_name": "C"},
+            ],
+            fill_policy="agents_now",
+        )
+        played = service.advance_agents(match, max_actions=2000)
+        assert played > 20

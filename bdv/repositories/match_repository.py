@@ -66,6 +66,32 @@ class MatchRepository(BaseRepository[BdvMatch]):
         )
         return rows, total
 
+    def list_open(
+        self, *, page: int = 1, per_page: int = 20
+    ) -> Tuple[List[BdvMatch], int]:
+        """Matches still in the lobby with at least one seat open."""
+        waiting = (
+            self._session.query(BdvSeat.match_id)
+            .filter(BdvSeat.kind == "open")
+            .distinct()
+        )
+        base = self._session.query(BdvMatch).filter(
+            BdvMatch.status == "lobby", BdvMatch.id.in_(waiting)
+        )
+        total = (
+            self._session.query(func.count(BdvMatch.id))
+            .filter(BdvMatch.status == "lobby", BdvMatch.id.in_(waiting))
+            .scalar()
+            or 0
+        )
+        rows = (
+            base.order_by(BdvMatch.created_at.desc())
+            .limit(per_page)
+            .offset((page - 1) * per_page)
+            .all()
+        )
+        return rows, total
+
     def seat_for_user(self, match: BdvMatch, user_id) -> Optional[BdvSeat]:
         for seat in match.seats or []:
             if seat.user_id and str(seat.user_id) == str(user_id):

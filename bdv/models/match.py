@@ -16,6 +16,14 @@ MATCH_STATUS_ABANDONED = "abandoned"
 SEAT_KIND_HUMAN = "human"
 SEAT_KIND_LLM = "llm"
 SEAT_KIND_BASELINE = "baseline"
+#: A seat held open for a human who has not joined yet.
+SEAT_KIND_OPEN = "open"
+
+#: How the remaining seats get filled when a match is created.
+FILL_AGENTS_NOW = "agents_now"  # start immediately against agents
+FILL_WAIT_FOREVER = "wait_forever"  # hold seats open indefinitely
+FILL_WAIT_THEN_AGENTS = "wait_then_agents"  # hold open until a deadline, then agents
+FILL_POLICIES = (FILL_AGENTS_NOW, FILL_WAIT_FOREVER, FILL_WAIT_THEN_AGENTS)
 
 OFFER_STATUS_OPEN = "open"
 OFFER_STATUS_ACCEPTED = "accepted"
@@ -54,6 +62,11 @@ class BdvMatch(BaseModel):
     chat_room_id = db.Column(db.UUID(as_uuid=True), nullable=True)
     winner_seat_index = db.Column(db.Integer, nullable=True)
     turn_deadline_at = db.Column(db.DateTime(timezone=True), nullable=True)
+    # How open seats get filled, and (for wait_then_agents) when the wait ends.
+    fill_policy = db.Column(
+        db.String(30), nullable=False, server_default=FILL_AGENTS_NOW
+    )
+    lobby_deadline_at = db.Column(db.DateTime(timezone=True), nullable=True)
     finished_at = db.Column(db.DateTime(timezone=True), nullable=True)
 
     seats = db.relationship(
@@ -73,6 +86,13 @@ class BdvMatch(BaseModel):
             "state_seq": self.state_seq,
             "spec_hash": self.spec_hash,
             "winner_seat_index": self.winner_seat_index,
+            "fill_policy": self.fill_policy,
+            "lobby_deadline_at": self.lobby_deadline_at.isoformat()
+            if self.lobby_deadline_at
+            else None,
+            "open_seats": sum(
+                1 for seat in (self.seats or []) if seat.kind == SEAT_KIND_OPEN
+            ),
             "chat_room_id": str(self.chat_room_id) if self.chat_room_id else None,
             "seats": [seat.to_dict() for seat in self.seats],
             "created_at": self.created_at.isoformat() if self.created_at else None,
@@ -88,9 +108,13 @@ class BdvSeat(BaseModel):
     __table_args__ = (
         db.UniqueConstraint("match_id", "seat_index", name="uq_bdv_seat_match_index"),
         # A seat is EITHER a human or an agent — never both, never neither.
+        # A seat is EITHER a human, OR an agent, OR unoccupied — the last case
+        # covering a baseline agent (no profile row) and a seat still held open
+        # for a human who has not joined.
         db.CheckConstraint(
             "(user_id IS NULL) <> (agent_profile_id IS NULL)"
-            " OR (user_id IS NULL AND agent_profile_id IS NULL AND kind = 'baseline')",
+            " OR (user_id IS NULL AND agent_profile_id IS NULL"
+            "     AND kind IN ('baseline', 'open'))",
             name="ck_bdv_seat_one_occupant",
         ),
     )
