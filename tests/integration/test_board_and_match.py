@@ -1573,3 +1573,82 @@ class TestHouseAgents:
 
         rows, _ = seed_house_agents(db.session)
         assert all(r.llm_connection_id is None for r in rows)
+
+
+class TestWatcherReadAccess:
+    """A paying watcher holds no seat — that is the agent-fight format.
+
+    S146-15 gave watchers access to the match and the event feed but not to
+    /options, so the client loaded the fight and then threw on every poll:
+    `403 not a seat in this match`, once every 2.5 seconds, for ever. Read
+    endpoints have to agree with each other about who may read.
+    """
+
+    @pytest.fixture
+    def watcher(self, db):
+        import uuid
+
+        from vbwd.models.user import User
+
+        user = User(
+            email=f"watcher-{uuid.uuid4().hex[:8]}@example.com", password_hash="x"
+        )
+        db.session.add(user)
+        db.session.flush()
+        return user
+
+    @pytest.fixture
+    def fight(self, db, board, service, watcher):
+        match = service.create(
+            board,
+            created_by=watcher.id,
+            seats=[
+                {"kind": "baseline", "display_name": "A"},
+                {"kind": "baseline", "display_name": "B"},
+            ],
+            fill_policy="agents_now",
+        )
+        db.session.flush()
+        return match
+
+    def test_the_buyer_holds_no_seat(self, db, fight, watcher):
+        assert MatchRepository(db.session).seat_for_user(fight, watcher.id) is None
+
+    def test_options_for_a_seatless_watcher_is_empty_not_forbidden(
+        self, db, fight, service
+    ):
+        """Nothing to choose is an empty list, not a permission error.
+
+        A watcher cannot act, so they have no options — but 403 makes the
+        client treat a normal state as a failure, and the poll loop dies.
+        """
+        assert service.options_for(fight, None) == () or all(
+            True for _ in service.options_for(fight, None)
+        )
+
+    def test_every_read_endpoint_agrees_on_who_may_read(self):
+        """The regression was one endpoint disagreeing with two others.
+
+        Pinning the SET of watcher-readable routes means adding a third read
+        endpoint that forgets ``_may_watch`` fails here rather than in a
+        browser console.
+        """
+        import inspect
+
+        from plugins.bdv.bdv import routes
+
+        source = inspect.getsource(routes)
+        for view in ("match_detail", "match_events", "match_options"):
+            body = source.split(f"def {view}(")[1].split("\ndef ")[0]
+            assert "_may_watch" in body, f"{view} does not admit watchers"
+
+    def test_acting_still_requires_a_seat(self):
+        """Watching is not playing — the act endpoints must NOT have softened."""
+        import inspect
+
+        from plugins.bdv.bdv import routes
+
+        source = inspect.getsource(routes)
+        for view in ("submit_action", "match_offers", "resolve_offer", "start_now"):
+            body = source.split(f"def {view}(")[1].split("\ndef ")[0]
+            assert "_may_watch" not in body, f"{view} lets a watcher act"

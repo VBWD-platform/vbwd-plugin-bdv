@@ -31,20 +31,25 @@ from ..core.pricing import OptionQuote, evaluate_options
 from ..core.state import ConstraintKind, MatchState, Phase
 from .baseline import BaselineSeat
 
-#: The move contract. Passed to ``LlmClient.generate`` so core's repair loop
-#: fixes malformed output before it ever reaches us.
+#: The move contract, in the LIGHTWEIGHT ``{field: type}`` form core expects.
+#:
+#: This was originally written as a full JSON Schema, which core's adapter does
+#: not take: it iterates the TOP-LEVEL KEYS of whatever it is handed and turns
+#: each into a tool field. A real schema therefore asked the model to fill in
+#: fields literally named ``type``, ``properties`` and ``required`` — and it
+#: obligingly did, returning a schema instead of a move. Every answer was then
+#: rejected as illegal, the repair retries burned, and the seat degraded to the
+#: baseline on its first real decision. The legal-move constraints live in
+#: ``_validate``, which is the only place that can enforce them anyway, since
+#: they depend on the board state rather than on the shape.
 MOVE_SCHEMA: Dict[str, Any] = {
-    "type": "object",
-    "properties": {
-        "action": {
-            "type": "string",
-            "enum": ["choose_option", "buy_property", "decline_purchase", "end_turn"],
-        },
-        "steps": {"type": "integer"},
-        "reasoning": {"type": "string"},
-    },
-    "required": ["action"],
+    "action": "string",
+    "steps": "integer",
+    "reasoning": "string",
 }
+
+#: Named so the failure shows up in the action log rather than nowhere.
+LEGAL_ACTIONS = ("choose_option", "buy_property", "decline_purchase", "end_turn")
 
 SYSTEM_PROMPT = (
     "You are playing BizDevVibes, a dice-market board game.\n"
@@ -55,6 +60,10 @@ SYSTEM_PROMPT = (
     "You may never spend more than the affordability cap shown.\n"
     "Prices and value estimates are computed by the engine and given to you; "
     "trust them rather than recomputing.\n"
+    "Answer with these fields: action (one of choose_option, buy_property, "
+    "decline_purchase, end_turn), steps (only for choose_option — it MUST be "
+    "one of the steps values listed in options), and reasoning (one short "
+    "sentence).\n"
     "Reply with JSON only."
 )
 
@@ -71,6 +80,10 @@ class LlmDecision:
     reasoning: str = ""
     degraded_from: Optional[str] = None
     attempts: int = 0
+    #: Why the model was abandoned, in words. Without this a degraded seat is
+    #: indistinguishable from a seat that simply never spoke — which is exactly
+    #: how a broken schema hid for a whole match.
+    failure: str = ""
 
 
 class LlmSeat:
@@ -183,14 +196,17 @@ class LlmSeat:
             )
 
         repair: Optional[str] = None
+        last_failure = ""
         for attempt in range(self._max_repair_retries + 1):
             try:
                 raw = self._ask(state, spec, seat_index, repair)
-            except Exception:  # provider error, timeout, malformed beyond repair
+            except Exception as provider_error:  # transport, timeout, bad JSON
+                last_failure = f"{type(provider_error).__name__}: {provider_error}"
                 break
             try:
                 action = self._validate(raw, state, spec, seat_index)
             except LlmSeatError as invalid:
+                last_failure = str(invalid)
                 repair = (
                     f"Your previous answer was rejected: {invalid}. "
                     "Answer again with a legal move."
@@ -202,12 +218,14 @@ class LlmSeat:
                 attempts=attempt + 1,
             )
 
-        # Every attempt failed — degrade for the rest of the match.
+        # Every attempt failed — degrade for the rest of the match, and SAY WHY.
         self.degraded = True
         return LlmDecision(
             action=self._fallback.next_action(state, spec, seat_index),
+            reasoning=f"degraded to baseline — {last_failure}"[:2000],
             degraded_from="illegal_or_error",
             attempts=self._max_repair_retries + 1,
+            failure=last_failure,
         )
 
     # --------------------------------------------------------------- helpers
@@ -291,7 +309,10 @@ class LlmSeat:
         if action_name == "end_turn":
             return Action(ActionType.END_TURN, seat_index)
 
-        raise LlmSeatError(f"unknown action {action_name!r}")
+        raise LlmSeatError(
+            f"unknown action {action_name!r} — legal actions are "
+            f"{', '.join(LEGAL_ACTIONS)}"
+        )
 
 
 def build_llm_seat(

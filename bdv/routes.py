@@ -1100,7 +1100,13 @@ def match_options(match_id):
         return jsonify({"error": "match not found"}), 404
     seat_index = _authorised_seat(match)
     if seat_index is None:
-        return jsonify({"error": "not a seat in this match"}), 403
+        if not _may_watch(match):
+            return jsonify({"error": "not a seat in this match"}), 403
+        # A watcher holds no seat, so there is nothing for them to choose. That
+        # is an EMPTY LIST, not a permission error: answering 403 here made the
+        # client treat a perfectly normal state as a failure and killed its poll
+        # loop on an agent fight.
+        return jsonify({"state_seq": match.state_seq, "items": []}), 200
     quotes = _match_service().options_for(match, seat_index)
     return (
         jsonify(
@@ -1237,7 +1243,8 @@ def match_messages(match_id):
     if not match:
         return jsonify({"error": "match not found"}), 404
     seat_index = _authorised_seat(match)
-    if seat_index is None:
+    # Reading is for anyone who may watch; TALKING needs a seat at the table.
+    if seat_index is None and not (request.method == "GET" and _may_watch(match)):
         return jsonify({"error": "not a seat in this match"}), 403
 
     if request.method == "GET":

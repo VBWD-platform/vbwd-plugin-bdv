@@ -253,3 +253,63 @@ class TestBuildFromProfile:
         assert seat._token_budget == 5000
         assert seat._system_prompt == "be ruthless"
         assert seen["slug"] is None
+
+
+class TestTheSchemaMatchesWhatCoreExpects:
+    """The bug that made every LLM seat silently useless.
+
+    Core's adapter iterates the TOP-LEVEL KEYS of ``json_schema`` and turns each
+    into a tool field. A full JSON Schema therefore asked the model to fill in
+    fields called ``type``, ``properties`` and ``required`` — and it did,
+    returning a schema instead of a move. Every answer was rejected as illegal,
+    the retries burned, and the seat degraded on its first real decision. A
+    whole match of "LLM agents" was two baseline policies playing each other.
+    """
+
+    def test_the_schema_is_a_flat_field_map(self):
+        from plugins.bdv.bdv.agents.llm_seat import MOVE_SCHEMA
+
+        assert set(MOVE_SCHEMA) == {"action", "steps", "reasoning"}
+        for key in ("type", "properties", "required"):
+            assert key not in MOVE_SCHEMA, "a JSON Schema was passed, not a field map"
+        assert all(isinstance(v, str) for v in MOVE_SCHEMA.values())
+
+    def test_the_prompt_still_names_the_legal_actions(self):
+        """The enum left the schema, so the prompt has to carry it."""
+        from plugins.bdv.bdv.agents.llm_seat import LEGAL_ACTIONS, SYSTEM_PROMPT
+
+        for action in LEGAL_ACTIONS:
+            assert action in SYSTEM_PROMPT
+
+
+class TestADegradedSeatSaysWhy:
+    """A silent fallback is indistinguishable from a seat that never spoke."""
+
+    class Parrot:
+        """Answers with the schema instead of a move — the real failure."""
+
+        def generate(self, system, user, **kwargs):
+            return {"type": {"move": "string"}, "properties": "{}", "required": "[]"}
+
+    class Dead:
+        def generate(self, system, user, **kwargs):
+            raise RuntimeError("connection refused")
+
+    def _seat(self, client):
+        from plugins.bdv.bdv.agents.llm_seat import LlmSeat
+
+        return LlmSeat(client=client, max_repair_retries=1)
+
+    def test_an_unusable_answer_is_recorded_in_words(self, choosing_state, tiny_spec):
+        seat = self._seat(self.Parrot())
+        decision = seat.decide(choosing_state, tiny_spec, 0)
+        assert seat.degraded is True
+        assert "unknown action" in decision.failure
+        assert "degraded to baseline" in decision.reasoning
+
+    def test_a_provider_outage_is_recorded_in_words(self, choosing_state, tiny_spec):
+        seat = self._seat(self.Dead())
+        decision = seat.decide(choosing_state, tiny_spec, 0)
+        assert seat.degraded is True
+        assert "connection refused" in decision.failure
+        assert decision.action is not None, "it still returns a legal move"
