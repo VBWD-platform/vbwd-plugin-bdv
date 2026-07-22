@@ -478,6 +478,55 @@ class MatchService:
             state, self.spec_for(match), state.pending_roll, seat_index
         )
 
+    def estate(self, match: BdvMatch, seat_index: int) -> List[Dict]:
+        """Every square this seat owns, with what may actually be DONE to it.
+
+        Computed here for the same reason prices are: a "Build" button that the
+        rules will refuse is worse than no button. The panel used to offer one
+        on every square, so building on an incomplete funnel stage looked
+        available and failed on click, every time.
+
+        Each entry carries the refusal REASON as well, because "you cannot" is
+        only half an answer — the useful half is "you must own the whole stage
+        first".
+        """
+        from ..core import economy
+
+        state = self.state_for(match)
+        spec = self.spec_for(match)
+        pledged = set(state.pledged_squares(seat_index))
+        rows: List[Dict] = []
+        for square_index in state.owned_by(seat_index):
+            square = spec.square(square_index)
+            # ``can_build`` already covers the stage rule, even building, the
+            # house cap AND affordability — re-checking cash here would be a
+            # second copy of a rule the engine owns.
+            build_problem = economy.can_build(state, spec, seat_index, square_index)
+            house_cost = square.house_cost or 0
+            rows.append(
+                {
+                    "index": square_index,
+                    "name": square.name,
+                    "stage": square.stage,
+                    "houses": state.houses_on(square_index),
+                    "house_cost": house_cost,
+                    "mortgage_value": square.mortgage_value,
+                    "pledged": square_index in pledged,
+                    "can_build": build_problem is None,
+                    "build_blocked_because": build_problem,
+                    "can_sell_house": economy.can_sell_house(
+                        state, spec, seat_index, square_index
+                    )
+                    is None,
+                    "can_sell_square": economy.can_sell_square(
+                        state, spec, seat_index, square_index
+                    )
+                    is None,
+                    "house_refund": economy.house_refund(spec, square_index),
+                }
+            )
+        return rows
+
     def settlement(self, match: BdvMatch, seat_index: int) -> Optional[Dict]:
         """What this seat owes and whether it can still do anything about it.
 

@@ -9,6 +9,7 @@ from decimal import Decimal
 
 import pytest
 
+from plugins.bdv.bdv.core import economy
 from plugins.bdv.bdv.core.engine import ActionType
 from plugins.bdv.bdv.core.state import Phase, RentDemand
 from plugins.bdv.bdv.repositories.board_repository import BoardRepository
@@ -1803,3 +1804,104 @@ class TestOnlyOneRequestDrivesAMatch:
         match = self._match(board, service)
         db.session.flush()
         assert service.advance_agents(match) > 0
+
+
+class TestEstateAffordances:
+    """A Build button the rules refuse is worse than no button.
+
+    The panel offered "Build" on every owned square, so building on an
+    incomplete funnel stage looked available and failed on every click. Worse,
+    the refusal escaped as a 500 rather than a 422, because EconomyError did not
+    descend from EngineError and the service's handler never saw it.
+    """
+
+    def _match(self, db, board, service):
+        match = service.create(
+            board,
+            created_by=None,
+            seats=[
+                {"kind": "baseline", "display_name": "A"},
+                {"kind": "baseline", "display_name": "B"},
+            ],
+            fill_policy="agents_now",
+        )
+        db.session.flush()
+        return match
+
+    def _own(self, service, match, db, indices, seat=0, cash=50000):
+        state = service.state_for(match)
+        for index in indices:
+            state = state.with_ownership(index, seat)
+        state = state.with_seat(dataclasses.replace(state.seat(seat), cash=cash))
+        service._persist_state(match, state)
+        db.session.flush()
+        return state
+
+    def _stage_of(self, service, match):
+        """A funnel stage and its member squares, from the real board."""
+        spec = service.spec_for(match)
+        for square in spec.squares:
+            if square.stage:
+                return square.stage, list(spec.stage_members(square.stage))
+        raise AssertionError("the seeded board has no staged squares")
+
+    def test_a_partial_stage_cannot_build_and_says_why(self, db, board, service):
+        match = self._match(db, board, service)
+        _stage, members = self._stage_of(service, match)
+        self._own(service, match, db, members[:1])
+
+        row = next(r for r in service.estate(match, 0) if r["index"] == members[0])
+        assert row["can_build"] is False
+        assert "whole funnel stage" in row["build_blocked_because"]
+
+    def test_a_complete_stage_can_build(self, db, board, service):
+        match = self._match(db, board, service)
+        _stage, members = self._stage_of(service, match)
+        self._own(service, match, db, members)
+
+        rows = {r["index"]: r for r in service.estate(match, 0)}
+        assert all(rows[i]["can_build"] for i in members)
+        assert all(rows[i]["build_blocked_because"] is None for i in members)
+
+    def test_affordability_is_part_of_the_answer(self, db, board, service):
+        """Offering a build the seat cannot pay for is the same broken button.
+
+        The reason comes from ``can_build`` rather than a second cash check
+        here — one rule, one owner.
+        """
+        match = self._match(db, board, service)
+        _stage, members = self._stage_of(service, match)
+        self._own(service, match, db, members, cash=1)
+
+        row = next(r for r in service.estate(match, 0) if r["index"] == members[0])
+        assert row["can_build"] is False
+        assert "cash" in row["build_blocked_because"]
+
+    def test_a_refused_build_is_a_rejection_not_a_server_fault(
+        self, db, board, service
+    ):
+        """EconomyError must be catchable as an EngineError."""
+        from plugins.bdv.bdv.core.engine import EngineError
+        from plugins.bdv.bdv.services.match_service import MatchError
+
+        match = self._match(db, board, service)
+        _stage, members = self._stage_of(service, match)
+        self._own(service, match, db, members[:1])
+
+        with pytest.raises(MatchError, match="whole funnel stage"):
+            service.submit(
+                match,
+                seat_index=0,
+                action_type="build_house",
+                payload={"square": members[0]},
+            )
+        assert issubclass(economy.EconomyError, EngineError)
+
+    def test_selling_is_gated_the_same_way(self, db, board, service):
+        match = self._match(db, board, service)
+        _stage, members = self._stage_of(service, match)
+        self._own(service, match, db, members)
+
+        row = next(r for r in service.estate(match, 0) if r["index"] == members[0])
+        assert row["can_sell_house"] is False, "no houses to sell yet"
+        assert row["can_sell_square"] is True

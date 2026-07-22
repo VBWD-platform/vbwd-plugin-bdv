@@ -1115,6 +1115,11 @@ def match_detail(match_id):
     payload["settlement"] = (
         service.settlement(match, seat_index) if seat_index is not None else None
     )
+    # What may actually be done to each square you own. The client must not
+    # decide this: a Build button the rules refuse is worse than no button.
+    payload["estate"] = (
+        service.estate(match, seat_index) if seat_index is not None else []
+    )
     rent_deadline = service.rent_deadline(match)
     payload["rent_deadline_at"] = rent_deadline.isoformat() if rent_deadline else None
     turn_deadline = service.turn_deadline(match)
@@ -1239,6 +1244,7 @@ def submit_action(match_id):
                 # it can no longer afford.
                 "purchase_offer": service.purchase_offer(match, seat_index),
                 "settlement": service.settlement(match, seat_index),
+                "estate": service.estate(match, seat_index),
                 # Same reason: a client that keeps a stale deadline shows no
                 # countdown on a demand raised by this very action.
                 "rent_deadline_at": (

@@ -12,6 +12,9 @@ from typing import Dict, List, Mapping, Optional, Tuple
 from . import economy
 from .board import BoardSpec, SquareKind
 from .dice import roll_at, shuffled_order
+
+# Re-exported: callers have always imported EngineError from this module.
+from .errors import EngineError  # noqa: F401
 from .effects import apply_effect
 from .fees import resolve_fee_policy
 from .options import legal_options, sum_option
@@ -33,10 +36,6 @@ from .state import (
 
 #: One seat may not bury another under proposals during a 5-minute window.
 MAX_OPEN_OFFERS_PER_SEAT = 5
-
-
-class EngineError(RuntimeError):
-    """Base for every rejected action."""
 
 
 class IllegalActionError(EngineError):

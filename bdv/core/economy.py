@@ -19,11 +19,17 @@ from dataclasses import replace
 from typing import Dict, List, Optional, Sequence, Tuple
 
 from .board import BoardSpec, SquareKind
+from .errors import EngineError
 from .state import Loan, MatchState
 
 
-class EconomyError(RuntimeError):
-    """A refused sale, advance or repayment."""
+class EconomyError(EngineError):
+    """A refused sale, advance, build or repayment.
+
+    An ``EngineError`` because that is exactly what it is: an action the rules
+    refuse. Descending from plain ``RuntimeError`` meant the service's handler
+    did not see it and the caller got a 500 for a legal-but-refused move.
+    """
 
 
 # ------------------------------------------------------------------ valuation
