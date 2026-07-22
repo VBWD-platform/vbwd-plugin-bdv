@@ -402,6 +402,21 @@ def execute_trade(
     }
 
 
+def completed_stages(state: MatchState, spec: BoardSpec, seat_index: int) -> int:
+    """How many stages this seat owns outright.
+
+    The unit a trade is really denominated in: a square is worth its price, but
+    the square that COMPLETES a stage is worth the right to build on all of
+    them. Valuing a trade without this reduces every negotiation to face value.
+    """
+    stages = {s.stage for s in spec.squares if s.kind == SquareKind.DEAL and s.stage}
+    return sum(
+        1
+        for stage in stages
+        if all(state.owner_of(i) == seat_index for i in spec.stage_members(stage))
+    )
+
+
 def stage_needs(state: MatchState, spec: BoardSpec, seat_index: int) -> Dict[str, list]:
     """Which squares a seat still needs to complete each stage it has a foot in.
 

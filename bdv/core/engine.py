@@ -27,8 +27,12 @@ from .state import (
     MatchState,
     Phase,
     RentDemand,
+    TradeOffer,
     initial_state,
 )
+
+#: One seat may not bury another under proposals during a 5-minute window.
+MAX_OPEN_OFFERS_PER_SEAT = 5
 
 
 class EngineError(RuntimeError):
@@ -63,7 +67,10 @@ class ActionType:
     TRANSFER_CREDITS = "transfer_credits"
     # --- the privatisation trading window (S146-13)
     OPEN_TRADING = "open_trading"
-    EXECUTE_TRADE = "execute_trade"
+    PROPOSE_TRADE = "propose_trade"
+    ACCEPT_TRADE = "accept_trade"
+    DECLINE_TRADE = "decline_trade"
+    COUNTER_TRADE = "counter_trade"
     TRADING_READY = "trading_ready"
     CLOSE_TRADING = "close_trading"
     OPEN_NEGOTIATION = "open_negotiation"
@@ -795,21 +802,182 @@ def _handle_open_trading(state, spec, config, action) -> ApplyResult:
     return ApplyResult(working, ({"type": "trading_opened"},))
 
 
-def _handle_execute_trade(state, spec, config, action) -> ApplyResult:
-    """Swap both legs atomically, or change nothing."""
+def _require_trading(state) -> None:
     if state.phase != Phase.TRADING:
         raise IllegalActionError("trading is not open")
+
+
+def _offer_terms(action, *, from_seat: int, to_seat: int) -> Dict:
+    """Read terms off the payload — but never WHO is giving.
+
+    ``from_seat`` is taken from the authenticated action, not the body. The
+    earlier design read it from the payload, which let any seat author a trade
+    in which somebody else gave their squares away.
+    """
     payload = action.payload
+    return {
+        "from_seat": from_seat,
+        "to_seat": to_seat,
+        "give_squares": tuple(
+            sorted({int(i) for i in payload.get("give_squares", [])})
+        ),
+        "give_credits": max(0, int(payload.get("give_credits", 0))),
+        "want_squares": tuple(
+            sorted({int(i) for i in payload.get("want_squares", [])})
+        ),
+        "want_credits": max(0, int(payload.get("want_credits", 0))),
+        "note": str(payload.get("note", ""))[:200],
+    }
+
+
+def _validate_terms(state, spec, terms: Dict) -> None:
+    """Refuse a proposal that could never be honoured.
+
+    Checked at PROPOSE time as well as at accept: an offer you cannot back is
+    not a negotiating position, it is a lie the counterparty spends their window
+    considering.
+    """
+    if terms["from_seat"] == terms["to_seat"]:
+        raise economy.EconomyError("you cannot trade with yourself")
+    if not 0 <= terms["to_seat"] < len(state.seats):
+        raise IllegalActionError("no such seat")
+    if state.seat(terms["to_seat"]).bankrupt:
+        raise IllegalActionError("that seat is out of the match")
+    if not any(
+        terms[key]
+        for key in ("give_squares", "give_credits", "want_squares", "want_credits")
+    ):
+        raise IllegalActionError("an empty trade is not an offer")
+    for square_index in terms["give_squares"]:
+        problem = economy.can_trade_square(
+            state, spec, terms["from_seat"], square_index
+        )
+        if problem:
+            raise economy.EconomyError(problem)
+    for square_index in terms["want_squares"]:
+        problem = economy.can_trade_square(state, spec, terms["to_seat"], square_index)
+        if problem:
+            raise economy.EconomyError(problem)
+    if state.seat(terms["from_seat"]).cash < terms["give_credits"]:
+        raise economy.EconomyError("proposer cannot cover their side")
+    if state.seat(terms["to_seat"]).cash < terms["want_credits"]:
+        raise economy.EconomyError("counterparty cannot cover their side")
+
+
+def _with_offer(state, terms: Dict) -> Tuple[MatchState, Dict]:
+    offer = TradeOffer(id=state.next_offer_id, **terms)
+    working = replace(
+        state,
+        trade_offers=state.trade_offers + (offer,),
+        next_offer_id=state.next_offer_id + 1,
+    )
+    return working, {
+        "type": "trade_proposed",
+        "seat": offer.from_seat,
+        "to": offer.to_seat,
+        "offer_id": offer.id,
+        "give_squares": list(offer.give_squares),
+        "give_credits": offer.give_credits,
+        "want_squares": list(offer.want_squares),
+        "want_credits": offer.want_credits,
+    }
+
+
+def _handle_propose_trade(state, spec, config, action) -> ApplyResult:
+    """Put terms to another seat. Nothing moves until they answer."""
+    _require_trading(state)
+    open_offers = [o for o in state.trade_offers if o.from_seat == action.seat_index]
+    if len(open_offers) >= MAX_OPEN_OFFERS_PER_SEAT:
+        raise IllegalActionError("too many open offers — withdraw one first")
+    terms = _offer_terms(
+        action, from_seat=action.seat_index, to_seat=int(action.payload["to_seat"])
+    )
+    _validate_terms(state, spec, terms)
+    working, event = _with_offer(state, terms)
+    return ApplyResult(working.bump(), (event,))
+
+
+def _resolve_offer(state, action) -> TradeOffer:
+    offer = state.offer(int(action.payload["offer_id"]))
+    if offer is None:
+        raise IllegalActionError("no such offer")
+    return offer
+
+
+def _handle_accept_trade(state, spec, config, action) -> ApplyResult:
+    """Consent. Both legs move, or neither does."""
+    _require_trading(state)
+    offer = _resolve_offer(state, action)
+    if action.seat_index != offer.to_seat:
+        raise IllegalActionError("that offer is not yours to answer")
+
     working, event = economy.execute_trade(
         state,
         spec,
-        from_seat=int(payload["from_seat"]),
-        to_seat=int(payload["to_seat"]),
-        give_squares=[int(i) for i in payload.get("give_squares", [])],
-        give_credits=int(payload.get("give_credits", 0)),
-        want_squares=[int(i) for i in payload.get("want_squares", [])],
-        want_credits=int(payload.get("want_credits", 0)),
+        from_seat=offer.from_seat,
+        to_seat=offer.to_seat,
+        give_squares=offer.give_squares,
+        give_credits=offer.give_credits,
+        want_squares=offer.want_squares,
+        want_credits=offer.want_credits,
     )
+    # Every other offer that promised a square this trade just moved is now a
+    # promise its author cannot keep. Dropping them here is what stops the same
+    # square being sold twice in one window.
+    moved = set(offer.give_squares) | set(offer.want_squares)
+    survivors = tuple(
+        o
+        for o in working.trade_offers
+        if o.id != offer.id and not any(o.touches(index) for index in moved)
+    )
+    working = replace(working, trade_offers=survivors)
+    event["offer_id"] = offer.id
+    return ApplyResult(working.bump(), (event,))
+
+
+def _handle_decline_trade(state, spec, config, action) -> ApplyResult:
+    """Say no — or withdraw your own offer. Same effect, one verb."""
+    _require_trading(state)
+    offer = _resolve_offer(state, action)
+    if not offer.involves(action.seat_index):
+        raise IllegalActionError("that offer is not yours to answer")
+    working = replace(
+        state, trade_offers=tuple(o for o in state.trade_offers if o.id != offer.id)
+    )
+    return ApplyResult(
+        working.bump(),
+        (
+            {
+                "type": "trade_declined",
+                "seat": action.seat_index,
+                "offer_id": offer.id,
+                "withdrawn": action.seat_index == offer.from_seat,
+            },
+        ),
+    )
+
+
+def _handle_counter_trade(state, spec, config, action) -> ApplyResult:
+    """Answer with different terms in ONE action.
+
+    Decline-then-propose would leave a moment with nothing on the table, and a
+    counter that raced the closing bell would vanish without a trace.
+    """
+    _require_trading(state)
+    original = _resolve_offer(state, action)
+    if action.seat_index != original.to_seat:
+        raise IllegalActionError("that offer is not yours to answer")
+
+    terms = _offer_terms(
+        action, from_seat=action.seat_index, to_seat=original.from_seat
+    )
+    _validate_terms(state, spec, terms)
+    working = replace(
+        state, trade_offers=tuple(o for o in state.trade_offers if o.id != original.id)
+    )
+    working, event = _with_offer(working, terms)
+    event["type"] = "trade_countered"
+    event["replaces"] = original.id
     return ApplyResult(working.bump(), (event,))
 
 
@@ -831,7 +999,13 @@ def _handle_close_trading(state, spec, config, action) -> ApplyResult:
     if state.phase != Phase.TRADING:
         raise IllegalActionError("trading is not open")
     working = replace(
-        state, phase=Phase.AWAIT_ROLL, trading_done=True, trading_ready=()
+        state,
+        phase=Phase.AWAIT_ROLL,
+        trading_done=True,
+        trading_ready=(),
+        # An unanswered offer dies with the window. Carrying it into normal play
+        # would let a seat accept, mid-turn, terms priced for a frozen board.
+        trade_offers=(),
     ).bump()
     return ApplyResult(working, ({"type": "trading_closed"},))
 
@@ -924,7 +1098,10 @@ _HANDLERS = {
     ActionType.REFUND_BRIBE: _handle_refund_bribe,
     ActionType.TURN_AUTO_SUM: _handle_turn_auto_sum,
     ActionType.OPEN_TRADING: _handle_open_trading,
-    ActionType.EXECUTE_TRADE: _handle_execute_trade,
+    ActionType.PROPOSE_TRADE: _handle_propose_trade,
+    ActionType.ACCEPT_TRADE: _handle_accept_trade,
+    ActionType.DECLINE_TRADE: _handle_decline_trade,
+    ActionType.COUNTER_TRADE: _handle_counter_trade,
     ActionType.TRADING_READY: _handle_trading_ready,
     ActionType.CLOSE_TRADING: _handle_close_trading,
 }

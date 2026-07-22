@@ -257,20 +257,7 @@ class MatchService:
             if state.phase == Phase.FINISHED:
                 break
             if state.phase == Phase.TRADING:
-                # Agents have nothing to negotiate — mark ready so a human is
-                # never left waiting out the full five minutes alone.
-                for seat_index in sorted(agent_seats):
-                    if seat_index not in state.trading_ready:
-                        try:
-                            self.submit(
-                                match,
-                                seat_index=seat_index,
-                                action_type=ActionType.TRADING_READY,
-                                payload={},
-                            )
-                            played += 1
-                        except MatchError:
-                            pass
+                played += self._advance_agent_trading(match, agent, spec, agent_seats)
                 self.resolve_trading_window(match)
                 break
 
@@ -482,6 +469,56 @@ class MatchService:
         return True
 
     # ------------------------------------------------------- trading window
+
+    def _advance_agent_trading(
+        self, match: BdvMatch, agent, spec, agent_seats: set
+    ) -> int:
+        """Answer what was put to the agents, bid once, then stand ready.
+
+        Answering first matters: a human whose offer is still open when the
+        agents mark ready would watch the window close on an unanswered
+        proposal. Each agent bids at most once per window, so the pass always
+        terminates — an agent that re-proposed a declined trade would spin.
+        """
+        played = 0
+        for seat_index in sorted(agent_seats):
+            state = self.state_for(match)
+            for offer in [o for o in state.trade_offers if o.to_seat == seat_index]:
+                action = agent.trade_response(state, spec, seat_index, offer)
+                if self._try_submit(match, action):
+                    played += 1
+                state = self.state_for(match)
+
+            if seat_index in state.trading_ready:
+                continue
+            proposal = agent.trade_proposal(state, spec, seat_index)
+            if proposal is not None and self._try_submit(match, proposal):
+                played += 1
+            # Ready means "done initiating" — the agent still answers whatever
+            # arrives next, so a human keeps a live counterparty either way.
+            if self._try_submit(
+                match, Action(ActionType.TRADING_READY, seat_index, {})
+            ):
+                played += 1
+        return played
+
+    def _try_submit(self, match: BdvMatch, action) -> bool:
+        """Submit an agent action, treating a refusal as "it changed its mind".
+
+        The board can move under an agent between deciding and acting — another
+        seat may take the square it was about to bid for. That is a normal race,
+        not an error worth failing the whole request over.
+        """
+        try:
+            self.submit(
+                match,
+                seat_index=action.seat_index,
+                action_type=action.type,
+                payload=action.payload,
+            )
+            return True
+        except MatchError:
+            return False
 
     def maybe_open_trading(self, match: BdvMatch) -> bool:
         """Open the window the moment the last ownable square is bought.

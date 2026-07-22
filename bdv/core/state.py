@@ -79,6 +79,33 @@ class Loan:
 
 
 @dataclass(frozen=True)
+class TradeOffer:
+    """Terms one seat has put to another, awaiting an answer.
+
+    Offers live in engine state rather than a side table on purpose. A trade is
+    the only move that transfers assets between two seats, so its CONSENT must
+    replay exactly like every other fact; a proposal row in the database would
+    be a second source of truth that the fold could not see, and an accept could
+    then execute terms the log never recorded.
+    """
+
+    id: int
+    from_seat: int
+    to_seat: int
+    give_squares: Tuple[int, ...] = ()
+    give_credits: int = 0
+    want_squares: Tuple[int, ...] = ()
+    want_credits: int = 0
+    note: str = ""
+
+    def touches(self, square_index: int) -> bool:
+        return square_index in self.give_squares or square_index in self.want_squares
+
+    def involves(self, seat_index: int) -> bool:
+        return seat_index in (self.from_seat, self.to_seat)
+
+
+@dataclass(frozen=True)
 class SeatState:
     index: int
     cash: int
@@ -110,6 +137,9 @@ class MatchState:
     trading_done: bool = False
     #: Seats that have marked themselves ready to close the window early.
     trading_ready: Tuple[int, ...] = ()
+    #: Trades put to the table and not yet answered.
+    trade_offers: Tuple[TradeOffer, ...] = ()
+    next_offer_id: int = 1
 
     def __post_init__(self) -> None:
         # Frozen dataclass: use object.__setattr__ to normalise defaults once.
@@ -195,6 +225,17 @@ class MatchState:
     def with_demand(self, demand: Optional[RentDemand]) -> "MatchState":
         return replace(self, pending_demand=demand)
 
+    # --------------------------------------------------------------- trading
+
+    def offer(self, offer_id: int) -> Optional[TradeOffer]:
+        for candidate in self.trade_offers:
+            if candidate.id == offer_id:
+                return candidate
+        return None
+
+    def offers_for(self, seat_index: int) -> Tuple[TradeOffer, ...]:
+        return tuple(o for o in self.trade_offers if o.involves(seat_index))
+
     # -------------------------------------------------------------- identity
 
     def state_hash(self) -> str:
@@ -230,6 +271,8 @@ class MatchState:
             "next_loan_id": self.next_loan_id,
             "trading_done": self.trading_done,
             "trading_ready": list(self.trading_ready),
+            "trade_offers": [_offer_payload(o) for o in self.trade_offers],
+            "next_offer_id": self.next_offer_id,
         }
         encoded = json.dumps(payload, sort_keys=True, separators=(",", ":"))
         return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
@@ -271,6 +314,8 @@ class MatchState:
                     "next_loan_id": self.next_loan_id,
                     "trading_done": self.trading_done,
                     "trading_ready": list(self.trading_ready),
+                    "trade_offers": [_offer_payload(o) for o in self.trade_offers],
+                    "next_offer_id": self.next_offer_id,
                 }
             )
         )
@@ -311,6 +356,10 @@ class MatchState:
             next_loan_id=payload.get("next_loan_id", 1),
             trading_done=payload.get("trading_done", False),
             trading_ready=tuple(payload.get("trading_ready", [])),
+            trade_offers=tuple(
+                _offer_from(row) for row in payload.get("trade_offers", [])
+            ),
+            next_offer_id=payload.get("next_offer_id", 1),
         )
 
 
@@ -340,6 +389,32 @@ def _demand_from(payload: Optional[Dict]) -> Optional[RentDemand]:
         offered=payload.get("offered"),
         offered_square=payload.get("offered_square"),
         countered=payload.get("countered", False),
+    )
+
+
+def _offer_payload(offer: TradeOffer) -> Dict:
+    return {
+        "id": offer.id,
+        "from_seat": offer.from_seat,
+        "to_seat": offer.to_seat,
+        "give_squares": list(offer.give_squares),
+        "give_credits": offer.give_credits,
+        "want_squares": list(offer.want_squares),
+        "want_credits": offer.want_credits,
+        "note": offer.note,
+    }
+
+
+def _offer_from(payload: Dict) -> TradeOffer:
+    return TradeOffer(
+        id=payload["id"],
+        from_seat=payload["from_seat"],
+        to_seat=payload["to_seat"],
+        give_squares=tuple(payload.get("give_squares", [])),
+        give_credits=payload.get("give_credits", 0),
+        want_squares=tuple(payload.get("want_squares", [])),
+        want_credits=payload.get("want_credits", 0),
+        note=payload.get("note", ""),
     )
 
 

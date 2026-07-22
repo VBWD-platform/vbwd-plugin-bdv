@@ -19,6 +19,11 @@ from plugins.bdv.bdv.core.engine import (
 from plugins.bdv.bdv.core.state import Phase, SeatState
 
 
+@pytest.fixture
+def config():
+    return MatchConfig(seed="regress", seat_count=3)
+
+
 class TestBankruptcyDuringResolution:
     """A seat that busts while resolving its own move must not keep the turn."""
 
@@ -124,3 +129,57 @@ class TestMatchEndIsNeverOverwritten:
         ).state
         with pytest.raises(IllegalActionError):
             apply(state, tiny_spec, config, Action(ActionType.ROLL, 1))
+
+
+class TestAgentsBuildOnWhatTheyCompleted:
+    """Completing a stage has to lead somewhere.
+
+    Agents traded their way to complete stages and then never built on them, so
+    the trading window redistributed assets and changed nothing about the game.
+    Rent on an unbuilt stage is a rounding error; building is the entire reason
+    to want a stage in the first place.
+    """
+
+    def _with_a_complete_stage(self, tiny_spec, config, cash):
+        from plugins.bdv.bdv.core.engine import new_match
+
+        state = new_match(tiny_spec, config)
+        for index in tiny_spec.stage_members("lead_gen"):
+            state = state.with_ownership(index, 0)
+        return dataclasses.replace(
+            state,
+            seats=tuple(
+                dataclasses.replace(seat, cash=cash) if seat.index == 0 else seat
+                for seat in state.seats
+            ),
+        )
+
+    def test_a_flush_agent_builds_before_rolling(self, tiny_spec, config):
+        from plugins.bdv.bdv.agents.baseline import BaselineSeat
+
+        state = self._with_a_complete_stage(tiny_spec, config, cash=9000)
+        action = BaselineSeat().next_action(state, tiny_spec, 0)
+        assert action.type == ActionType.BUILD_HOUSE
+        assert action.payload["square"] in tiny_spec.stage_members("lead_gen")
+
+    def test_it_does_not_build_itself_broke(self, tiny_spec, config):
+        """A house is worthless if the next rent bill bankrupts you."""
+        from plugins.bdv.bdv.agents.baseline import BaselineSeat
+
+        state = self._with_a_complete_stage(tiny_spec, config, cash=700)
+        action = BaselineSeat().next_action(state, tiny_spec, 0)
+        assert action.type == ActionType.ROLL
+
+    def test_an_incomplete_stage_buys_nothing(self, tiny_spec, config):
+        from plugins.bdv.bdv.agents.baseline import BaselineSeat
+        from plugins.bdv.bdv.core.engine import new_match
+
+        state = new_match(tiny_spec, config).with_ownership(1, 0)
+        state = dataclasses.replace(
+            state,
+            seats=tuple(
+                dataclasses.replace(seat, cash=9000) if seat.index == 0 else seat
+                for seat in state.seats
+            ),
+        )
+        assert BaselineSeat().next_action(state, tiny_spec, 0).type == ActionType.ROLL

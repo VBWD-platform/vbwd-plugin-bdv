@@ -563,25 +563,45 @@ class TestPrivatisationTradingWindow:
         state = self._all_owned(tiny_spec, config)
         return apply(state, tiny_spec, config, Action(ActionType.OPEN_TRADING, 0)).state
 
-    def test_a_square_for_credits_swap(self, tiny_spec, config):
-        state = self._trading(tiny_spec, config)
-        total = sum(s.cash for s in state.seats)
-        result = apply(
+    def _traded(self, state, tiny_spec, config, payload):
+        """Propose, then accept — the only way a square changes hands.
+
+        Consent itself is pinned in test_trading_consent.py; here it is just the
+        handshake these economy assertions have to go through.
+        """
+        proposer = payload.pop("from_seat")
+        state = apply(
+            state,
+            tiny_spec,
+            config,
+            Action(ActionType.PROPOSE_TRADE, proposer, payload),
+        ).state
+        return apply(
             state,
             tiny_spec,
             config,
             Action(
-                ActionType.EXECUTE_TRADE,
-                0,
-                {
-                    "from_seat": 1,
-                    "to_seat": 0,
-                    "give_squares": [5],
-                    "give_credits": 0,
-                    "want_squares": [],
-                    "want_credits": 400,
-                },
+                ActionType.ACCEPT_TRADE,
+                payload["to_seat"],
+                {"offer_id": state.trade_offers[-1].id},
             ),
+        )
+
+    def test_a_square_for_credits_swap(self, tiny_spec, config):
+        state = self._trading(tiny_spec, config)
+        total = sum(s.cash for s in state.seats)
+        result = self._traded(
+            state,
+            tiny_spec,
+            config,
+            {
+                "from_seat": 1,
+                "to_seat": 0,
+                "give_squares": [5],
+                "give_credits": 0,
+                "want_squares": [],
+                "want_credits": 400,
+            },
         )
         assert result.state.owner_of(5) == 0, "square changed hands"
         assert result.state.seat(1).cash == 2000 + 400
@@ -590,20 +610,16 @@ class TestPrivatisationTradingWindow:
 
     def test_a_square_for_square_swap(self, tiny_spec, config):
         state = self._trading(tiny_spec, config)
-        result = apply(
+        result = self._traded(
             state,
             tiny_spec,
             config,
-            Action(
-                ActionType.EXECUTE_TRADE,
-                0,
-                {
-                    "from_seat": 0,
-                    "to_seat": 1,
-                    "give_squares": [6],
-                    "want_squares": [5],
-                },
-            ),
+            {
+                "from_seat": 0,
+                "to_seat": 1,
+                "give_squares": [6],
+                "want_squares": [5],
+            },
         )
         assert result.state.owner_of(6) == 1
         assert result.state.owner_of(5) == 0
@@ -624,20 +640,16 @@ class TestPrivatisationTradingWindow:
         state = apply(
             state, tiny_spec, config, Action(ActionType.OPEN_TRADING, 0)
         ).state
-        state = apply(
+        state = self._traded(
             state,
             tiny_spec,
             config,
-            Action(
-                ActionType.EXECUTE_TRADE,
-                0,
-                {
-                    "from_seat": 0,
-                    "to_seat": 1,
-                    "give_credits": 500,
-                    "want_squares": [3],
-                },
-            ),
+            {
+                "from_seat": 0,
+                "to_seat": 1,
+                "give_credits": 500,
+                "want_squares": [3],
+            },
         ).state
         state = apply(
             state, tiny_spec, config, Action(ActionType.CLOSE_TRADING, 0)
@@ -658,7 +670,10 @@ class TestPrivatisationTradingWindow:
         state = self._trading(tiny_spec, config)
         with pytest.raises(economy.EconomyError, match=message):
             apply(
-                state, tiny_spec, config, Action(ActionType.EXECUTE_TRADE, 0, payload)
+                state,
+                tiny_spec,
+                config,
+                Action(ActionType.PROPOSE_TRADE, payload.pop("from_seat"), payload),
             )
 
     def test_a_built_square_cannot_be_traded(self, tiny_spec, config):
@@ -669,9 +684,7 @@ class TestPrivatisationTradingWindow:
                 tiny_spec,
                 config,
                 Action(
-                    ActionType.EXECUTE_TRADE,
-                    0,
-                    {"from_seat": 0, "to_seat": 1, "give_squares": [1]},
+                    ActionType.PROPOSE_TRADE, 0, {"to_seat": 1, "give_squares": [1]}
                 ),
             )
 
@@ -689,30 +702,46 @@ class TestPrivatisationTradingWindow:
                 tiny_spec,
                 config,
                 Action(
-                    ActionType.EXECUTE_TRADE,
-                    0,
-                    {"from_seat": 0, "to_seat": 1, "give_squares": [1]},
+                    ActionType.PROPOSE_TRADE, 0, {"to_seat": 1, "give_squares": [1]}
                 ),
             )
 
-    def test_a_failed_leg_moves_nothing(self, tiny_spec, config):
+    def test_a_leg_that_went_stale_moves_nothing(self, tiny_spec, config):
+        """Terms are re-checked on ACCEPT, not merely when proposed.
+
+        The window lets a seat sign two deals at once, so cash it could cover
+        when the first offer arrived may be gone by the time it answers. The
+        trade must then fail whole — never half.
+        """
         state = self._trading(tiny_spec, config)
+        state = apply(
+            state,
+            tiny_spec,
+            config,
+            Action(
+                ActionType.PROPOSE_TRADE,
+                0,
+                {"to_seat": 1, "give_squares": [1], "want_credits": 1800},
+            ),
+        ).state
+        stale_offer = state.trade_offers[0].id
+
+        # Meanwhile seat 1 spends on something else.
+        state = self._traded(
+            state,
+            tiny_spec,
+            config,
+            {"from_seat": 1, "to_seat": 0, "give_credits": 1000, "want_squares": [6]},
+        ).state
+        assert state.seat(1).cash == 1000
+
         before = state.state_hash()
-        with pytest.raises(economy.EconomyError):
+        with pytest.raises(economy.EconomyError, match="cannot cover"):
             apply(
                 state,
                 tiny_spec,
                 config,
-                Action(
-                    ActionType.EXECUTE_TRADE,
-                    0,
-                    {
-                        "from_seat": 0,
-                        "to_seat": 1,
-                        "give_squares": [1],
-                        "want_credits": 99999,
-                    },
-                ),
+                Action(ActionType.ACCEPT_TRADE, 1, {"offer_id": stale_offer}),
             )
         assert state.state_hash() == before, "atomic: both legs or neither"
 
@@ -724,9 +753,7 @@ class TestPrivatisationTradingWindow:
                 tiny_spec,
                 config,
                 Action(
-                    ActionType.EXECUTE_TRADE,
-                    0,
-                    {"from_seat": 0, "to_seat": 1, "give_squares": [1]},
+                    ActionType.PROPOSE_TRADE, 0, {"to_seat": 1, "give_squares": [1]}
                 ),
             )
 

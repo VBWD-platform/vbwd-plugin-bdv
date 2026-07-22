@@ -834,3 +834,88 @@ class TestOfferEscrow:
         service.offer_bribe(match, from_seat=2, to_seat=0, amount=200)
         service.accept_offer(match, winner, seat_index=0)
         assert service.state_for(match).seat(2).cash == before_two, "loser made whole"
+
+
+class TestAgentsNegotiateInTheTradingWindow:
+    """A window in which the agents just pass is a window that does nothing.
+
+    Every seat here is an agent, so the whole negotiation has to run itself —
+    which is also the shape the 500-match balance harness needs.
+    """
+
+    def _privatised(self, db, board, service):
+        """A live match with every ownable square split between two seats."""
+        match = service.create(
+            board,
+            created_by=None,
+            seats=[
+                {"kind": "baseline", "display_name": "A"},
+                {"kind": "baseline", "display_name": "B"},
+            ],
+            fill_policy="agents_now",
+        )
+        spec = service.spec_for(match)
+        state = service.state_for(match)
+        for position, square in enumerate(s for s in spec.squares if s.is_ownable):
+            state = state.with_ownership(square.index, position % 2)
+        service._persist_state(match, state)
+        db.session.flush()
+        return match
+
+    def test_the_window_opens_and_then_closes_itself(self, db, board, service):
+        match = self._privatised(db, board, service)
+        assert service.maybe_open_trading(match) is True
+        service.advance_agents(match)
+        state = service.state_for(match)
+        assert state.trading_done is True, "agents finished without the deadline"
+        assert state.phase != Phase.TRADING
+
+    def test_agents_bid_for_the_squares_they_need(self, db, board, service):
+        match = self._privatised(db, board, service)
+        service.maybe_open_trading(match)
+        service.advance_agents(match)
+        kinds = [row.type for row in ActionRepository(db.session).for_match(match.id)]
+        assert ActionType.PROPOSE_TRADE in kinds, "nobody opened a negotiation"
+        assert (
+            ActionType.ACCEPT_TRADE in kinds or ActionType.DECLINE_TRADE in kinds
+        ), "a proposal went unanswered"
+
+    def test_credits_are_conserved_across_the_window(self, db, board, service):
+        match = self._privatised(db, board, service)
+        before = sum(s.cash for s in service.state_for(match).seats)
+        service.maybe_open_trading(match)
+        service.advance_agents(match)
+        after = sum(s.cash for s in service.state_for(match).seats)
+        assert after == before, "trading minted or burned credits"
+
+    def test_every_trade_replays_from_the_log(self, db, board, service):
+        """The whole point of trades being engine actions.
+
+        Folding from action zero is not available here — this fixture STAGES the
+        ownership rather than playing 40 purchases — so the fold starts from the
+        snapshot taken as the window opened. That still proves the thing at
+        issue: the trades themselves carry every fact needed to reproduce them.
+        """
+        from plugins.bdv.bdv.core.engine import Action, apply
+
+        match = self._privatised(db, board, service)
+        service.maybe_open_trading(match)
+        opened = service.state_for(match)
+        first_trading_seq = ActionRepository(db.session).for_match(match.id)[-1].seq
+
+        service.advance_agents(match)
+        db.session.flush()
+
+        spec = service.spec_for(match)
+        config = service._config(match)
+        folded = opened
+        for row in ActionRepository(db.session).for_match(match.id):
+            if row.seq <= first_trading_seq:
+                continue
+            folded = apply(
+                folded,
+                spec,
+                config,
+                Action(row.type, row.seat_index, row.payload or {}),
+            ).state
+        assert folded.state_hash() == service.state_for(match).state_hash()
