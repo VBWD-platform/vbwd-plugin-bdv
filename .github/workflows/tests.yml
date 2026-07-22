@@ -29,6 +29,15 @@ jobs:
         with:
           path: vbwd-backend/plugins/bdv
 
+      # The ENGINE is pure and needs no peers, but the chat-bridge tests exercise
+      # a real seam and import bot-base's neutral DTOs. Per-plugin CI clones only
+      # the plugin under test, so without this the bridge suite cannot even
+      # import. Shallow clone — it is only needed for the types.
+      - name: Clone peer plugin (bot_base)
+        run: |
+          git clone --depth=1 -q https://github.com/VBWD-platform/vbwd-plugin-bot-base.git \
+            vbwd-backend/plugins/bot_base
+
       - name: Set up Python 3.11
         uses: actions/setup-python@v5
         with:
@@ -48,8 +57,8 @@ jobs:
       - name: Style check — Mypy
         run: mypy vbwd-backend/plugins/bdv/bdv/ --ignore-missing-imports --no-error-summary --python-version=3.11 || true
 
-      # The engine is pure, so the whole unit suite runs with no database and no
-      # peer plugins — that is the point of the purity oracle in this suite.
+      # No database: the engine is pure and the bridge tests use fakes. The
+      # purity oracle in this suite proves core/ stayed dependency-free.
       - name: Run unit tests
         working-directory: vbwd-backend
         run: python -m pytest plugins/bdv/tests/unit/ -v --tb=short
