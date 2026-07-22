@@ -555,3 +555,66 @@ class TestMatchSlug:
 
     def test_lookup_misses_return_none(self, db, board, service):
         assert MatchRepository(db.session).find_by_slug("no-such-table") is None
+
+
+class TestPurchaseOffer:
+    """The 'Buy this square' affordance is decided server-side."""
+
+    def _match(self, service, board, user_id=None):
+        return service.create(
+            board,
+            created_by=user_id,
+            seats=[
+                {"kind": "baseline", "display_name": "You"},
+                {"kind": "baseline", "display_name": "A"},
+                {"kind": "baseline", "display_name": "B"},
+            ],
+            fill_policy="agents_now",
+        )
+
+    def test_no_offer_on_a_non_purchasable_square(self, db, board, service):
+        match = self._match(service, board)
+        # Seat 0 starts on New Quarter (the GO corner) — never purchasable.
+        assert service.purchase_offer(match, 0) is None
+
+    def test_offer_on_an_unowned_deal_square(self, db, board, service):
+        import dataclasses
+
+        match = self._match(service, board)
+        state = service.state_for(match)
+        moved = state.with_seat(dataclasses.replace(state.seat(0), position=1))
+        match.state_snapshot = moved.to_dict()
+        db.session.flush()
+
+        offer = service.purchase_offer(match, 0)
+        assert offer is not None
+        assert offer["square_index"] == 1
+        assert offer["price"] > 0
+        assert offer["affordable"] is True
+
+    def test_no_offer_when_the_square_is_already_owned(self, db, board, service):
+        import dataclasses
+
+        match = self._match(service, board)
+        state = service.state_for(match)
+        moved = state.with_seat(dataclasses.replace(state.seat(0), position=1))
+        match.state_snapshot = moved.with_ownership(1, 1).to_dict()
+        db.session.flush()
+        assert service.purchase_offer(match, 0) is None
+
+    def test_offer_is_marked_unaffordable_rather_than_hidden(self, db, board, service):
+        """Seeing the price you cannot meet is consistent with the option cards."""
+        import dataclasses
+
+        match = self._match(service, board)
+        state = service.state_for(match)
+        broke = state.with_seat(dataclasses.replace(state.seat(0), position=1, cash=1))
+        match.state_snapshot = broke.to_dict()
+        db.session.flush()
+
+        offer = service.purchase_offer(match, 0)
+        assert offer is not None and offer["affordable"] is False
+
+    def test_no_offer_when_it_is_not_your_turn(self, db, board, service):
+        match = self._match(service, board)
+        assert service.purchase_offer(match, 1) is None

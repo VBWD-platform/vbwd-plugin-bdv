@@ -653,7 +653,13 @@ def match_detail(match_id):
 
     payload = match.to_dict(include_state=True)
     payload["spec"] = match.spec_snapshot
-    payload["your_seat"] = _authorised_seat(match)
+    seat_index = _authorised_seat(match)
+    payload["your_seat"] = seat_index
+    # Whether "Buy this square" should be offered at all — computed server-side
+    # so the button can never be shown for a move that would be refused.
+    payload["purchase_offer"] = (
+        service.purchase_offer(match, seat_index) if seat_index is not None else None
+    )
     return jsonify(payload), 200
 
 

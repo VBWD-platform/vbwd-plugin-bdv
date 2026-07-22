@@ -302,6 +302,31 @@ class MatchService:
             state, self.spec_for(match), state.pending_roll, seat_index
         )
 
+    def purchase_offer(self, match: BdvMatch, seat_index: int) -> Optional[Dict]:
+        """The square this seat could buy right now, or None.
+
+        The UI must not offer "Buy this square" when the square is owned, is not
+        purchasable, or the seat cannot afford it — a button that always fails is
+        worse than no button.
+        """
+        state = self.state_for(match)
+        if state.phase == Phase.FINISHED or state.turn_seat != seat_index:
+            return None
+        spec = self.spec_for(match)
+        seat = state.seat(seat_index)
+        square = spec.square(seat.position)
+        if not square.is_ownable or not square.price:
+            return None
+        if state.owner_of(seat.position) is not None:
+            return None
+        return {
+            "square_index": seat.position,
+            "name": square.name,
+            "price": square.price,
+            "affordable": seat.cash >= square.price,
+            "stage": square.stage,
+        }
+
     def events_since(self, match: BdvMatch, since: int = -1) -> List[Dict]:
         return [row.to_dict() for row in self._actions.for_match(match.id, since)]
 
