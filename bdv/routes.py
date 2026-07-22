@@ -9,7 +9,11 @@ run through every mutating handler:
 from flask import Blueprint, current_app, g, jsonify, request
 
 from vbwd.extensions import db
-from vbwd.middleware.auth import require_auth, require_permission
+from vbwd.middleware.auth import (
+    require_auth,
+    require_permission,
+    require_user_permission,
+)
 from vbwd.utils.pagination import paginate
 
 from .core.effects import op_descriptors, validate_effect
@@ -63,7 +67,14 @@ def _page_args():
 
 
 def _current_user_id():
-    user = getattr(g, "current_user", None)
+    """The authenticated user's id.
+
+    ``require_auth`` sets ``g.user`` — NOT ``g.current_user``. Reading the wrong
+    attribute silently yields None, which would create human seats with a NULL
+    ``user_id`` (violating ck_bdv_seat_one_occupant) and make seat authorisation
+    never match.
+    """
+    user = getattr(g, "user", None)
     return getattr(user, "id", None) if user else None
 
 
@@ -446,14 +457,14 @@ def admin_match_detail(match_id):
 
 @bdv_bp.route(f"{PLAY}/boards", methods=["GET"])
 @require_auth
-@require_permission("bdv.play")
+@require_user_permission("bdv.play")
 def playable_boards():
     return jsonify({"items": [b.to_dict() for b in _boards().published()]}), 200
 
 
 @bdv_bp.route(f"{PLAY}/matches", methods=["GET"])
 @require_auth
-@require_permission("bdv.play")
+@require_user_permission("bdv.play")
 def my_matches():
     page, per_page = _page_args()
     rows, total = _matches().list_for_user(
@@ -464,7 +475,7 @@ def my_matches():
 
 @bdv_bp.route(f"{PLAY}/matches", methods=["POST"])
 @require_auth
-@require_permission("bdv.play")
+@require_user_permission("bdv.play")
 def create_match():
     data = request.get_json(silent=True) or {}
     board = _boards().find_by_slug(data.get("board_slug", "")) or _boards().find_by_id(
@@ -513,7 +524,7 @@ def _authorised_seat(match):
 
 @bdv_bp.route(f"{PLAY}/matches/<match_id>", methods=["GET"])
 @require_auth
-@require_permission("bdv.play")
+@require_user_permission("bdv.play")
 def match_detail(match_id):
     match = _matches().find_by_id(match_id)
     if not match:
@@ -528,7 +539,7 @@ def match_detail(match_id):
 
 @bdv_bp.route(f"{PLAY}/matches/<match_id>/options", methods=["GET"])
 @require_auth
-@require_permission("bdv.play")
+@require_user_permission("bdv.play")
 def match_options(match_id):
     match = _matches().find_by_id(match_id)
     if not match:
@@ -564,7 +575,7 @@ def match_options(match_id):
 
 @bdv_bp.route(f"{PLAY}/matches/<match_id>/actions", methods=["POST"])
 @require_auth
-@require_permission("bdv.play")
+@require_user_permission("bdv.play")
 def submit_action(match_id):
     match = _matches().find_by_id(match_id)
     if not match:
@@ -612,7 +623,7 @@ def submit_action(match_id):
 
 @bdv_bp.route(f"{PLAY}/matches/<match_id>/events", methods=["GET"])
 @require_auth
-@require_permission("bdv.play")
+@require_user_permission("bdv.play")
 def match_events(match_id):
     match = _matches().find_by_id(match_id)
     if not match:
@@ -636,7 +647,7 @@ def match_events(match_id):
 
 @bdv_bp.route(f"{PLAY}/matches/<match_id>/offers", methods=["GET", "POST"])
 @require_auth
-@require_permission("bdv.play")
+@require_user_permission("bdv.play")
 def match_offers(match_id):
     match = _matches().find_by_id(match_id)
     if not match:
@@ -670,7 +681,7 @@ def match_offers(match_id):
 
 @bdv_bp.route(f"{PLAY}/offers/<offer_id>/<decision>", methods=["POST"])
 @require_auth
-@require_permission("bdv.play")
+@require_user_permission("bdv.play")
 def resolve_offer(offer_id, decision):
     if decision not in {"accept", "decline"}:
         return jsonify({"error": "unknown decision"}), 422
@@ -698,7 +709,7 @@ def resolve_offer(offer_id, decision):
 
 @bdv_bp.route(f"{PLAY}/agent-profiles", methods=["GET"])
 @require_auth
-@require_permission("bdv.play")
+@require_user_permission("bdv.play")
 def list_agent_profiles():
     rows = AgentProfileRepository(db.session).active()
     return (

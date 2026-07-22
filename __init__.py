@@ -91,6 +91,19 @@ class BdvPlugin(BasePlugin):
         return ""
 
     @property
+    def user_permissions(self):
+        """Player-facing. The game is FREE for any logged-in user — this exists
+        so an operator *can* gate it (e.g. behind a paid tier) by removing it
+        from an access level, not because it is gated by default."""
+        return [
+            {
+                "key": "bdv.play",
+                "label": "Play BizDevVibes",
+                "group": "BizDevVibes",
+            },
+        ]
+
+    @property
     def admin_permissions(self):
         return [
             {
