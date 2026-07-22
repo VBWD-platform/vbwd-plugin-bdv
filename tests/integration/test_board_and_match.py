@@ -1735,3 +1735,71 @@ class TestChoosingYourOpponents:
         seats = self._seats_for([{}, {}])
         assert [s["kind"] for s in seats] == ["baseline", "baseline"]
         assert all(s["agent_profile_id"] is None for s in seats)
+
+
+class TestOnlyOneRequestDrivesAMatch:
+    """Concurrent polls collided on the action log and 500'd.
+
+    An agent turn can involve a provider call, so a poll can easily outlast the
+    2.5s poll interval. Several requests then sat inside advance_agents for the
+    same match, each computed the same next seq, and the second insert violated
+    uq_bdv_action_match_seq. The constraint did its job — the log never
+    corrupted — but the browser saw `500 Internal Server Error`.
+    """
+
+    def _match(self, board, service):
+        return service.create(
+            board,
+            created_by=None,
+            seats=[
+                {"kind": "baseline", "display_name": "A"},
+                {"kind": "baseline", "display_name": "B"},
+            ],
+            fill_policy="agents_now",
+        )
+
+    def test_the_lock_is_taken_while_agents_play(self, db, board, service):
+        match = self._match(board, service)
+        assert service._acquire_turn_lock(match) is True
+
+    def test_a_second_holder_is_refused_rather_than_queued(self, db, board, service):
+        """Waiting is what produced the 30-second timeouts.
+
+        The other request is already doing this work, so this one returns the
+        state it has instead of queueing behind a provider call.
+        """
+        from sqlalchemy import create_engine, text
+
+        match = self._match(board, service)
+        db.session.flush()
+        assert service._acquire_turn_lock(match) is True
+
+        # A genuinely separate connection — the same session would re-enter its
+        # own lock and prove nothing.
+        key = int.from_bytes(match.id.bytes[:8], "big", signed=True)
+        url = db.session.get_bind().engine.url
+        other = create_engine(url)
+        with other.connect() as connection:
+            with connection.begin():
+                held = connection.execute(
+                    text("SELECT pg_try_advisory_xact_lock(:key)"), {"key": key}
+                ).scalar()
+        other.dispose()
+        assert held is False, "a second request could drive the same match"
+
+    def test_a_locked_out_request_plays_nothing_and_does_not_raise(
+        self, db, board, service
+    ):
+        match = self._match(board, service)
+        db.session.flush()
+        original = service._acquire_turn_lock
+        service._acquire_turn_lock = lambda _match: False
+        try:
+            assert service.advance_agents(match) == 0
+        finally:
+            service._acquire_turn_lock = original
+
+    def test_the_holder_still_plays_normally(self, db, board, service):
+        match = self._match(board, service)
+        db.session.flush()
+        assert service.advance_agents(match) > 0

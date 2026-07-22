@@ -267,6 +267,18 @@ class MatchService:
 
         if match.status != MATCH_STATUS_ACTIVE:
             return 0
+        # Only ONE request may drive a given match at a time. Since agent turns
+        # can involve provider calls, a poll can outlast the poll interval, so
+        # several requests end up inside this method for the same match at once
+        # — and they each compute the same next action seq and collide on
+        # uq_bdv_action_match_seq. The constraint caught it (the log never
+        # corrupted) but the caller saw a 500.
+        #
+        # The lock is TRY, not wait: whoever holds it is already doing this
+        # work, so a second request should return the current state promptly
+        # rather than queue behind a provider call and time out.
+        if not self._acquire_turn_lock(match):
+            return 0
 
         agent_kinds = {SEAT_KIND_BASELINE, "llm"}
         agent_seats = {s.seat_index for s in match.seats if s.kind in agent_kinds}
@@ -339,6 +351,25 @@ class MatchService:
                     break
         self._persist_llm_state(match, drivers)
         return played
+
+    def _acquire_turn_lock(self, match: BdvMatch) -> bool:
+        """Take a non-blocking advisory lock on this match for the transaction.
+
+        Released automatically when the transaction ends, so there is no lock to
+        leak on an error path. A backend without advisory locks degrades to the
+        previous behaviour rather than refusing to play.
+        """
+        try:
+            from sqlalchemy import text
+
+            key = int.from_bytes(match.id.bytes[:8], "big", signed=True)
+            return bool(
+                self._session.execute(
+                    text("SELECT pg_try_advisory_xact_lock(:key)"), {"key": key}
+                ).scalar()
+            )
+        except Exception:
+            return True
 
     def _seat_drivers(self, match: BdvMatch, fallback, agent_seats: set) -> Dict:
         """Resolve each agent seat to the thing that will play it.
