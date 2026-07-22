@@ -54,6 +54,11 @@
       "type": "number"
     },
     {
+      "key": "agent_max_llm_calls_per_request",
+      "label": "Model moves per request",
+      "type": "number"
+    },
+    {
       "key": "debug_mode",
       "label": "Debug mode",
       "type": "boolean"

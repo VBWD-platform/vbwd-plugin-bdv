@@ -33,13 +33,13 @@ from .models.match import (
 )
 from .repositories.board_repository import BoardRepository
 from .repositories.match_repository import (
-    ActionRepository,
     AgentProfileRepository,
     MatchRepository,
     OfferRepository,
 )
 from .services.board_spec_factory import BoardSpecFactory
 from .services.match_service import MatchError, MatchService, StaleStateError
+from .services.service_factory import build_match_service, plugin_config
 
 bdv_bp = Blueprint("bdv", __name__)
 
@@ -59,12 +59,7 @@ def _matches() -> MatchRepository:
 
 
 def _match_service() -> MatchService:
-    return MatchService(
-        db.session,
-        MatchRepository(db.session),
-        ActionRepository(db.session),
-        OfferRepository(db.session),
-    )
+    return build_match_service()
 
 
 def _page_args():
@@ -795,22 +790,6 @@ def create_match():
     return jsonify(match.to_dict(include_state=True)), 201
 
 
-def _plugin_config(key: str, default):
-    """Read a plugin config value, falling back when the plugin is not mounted.
-
-    The price of an agent fight is admin-configurable rather than hard-coded, so
-    it must come from here — but a missing plugin manager must not 500 a read.
-    """
-    try:
-        manager = getattr(current_app, "plugin_manager", None)
-        plugin = manager.get_plugin("bdv") if manager else None
-        if plugin is not None:
-            return plugin.get_config(key, default)
-    except Exception:
-        pass
-    return default
-
-
 @bdv_bp.route(f"{PLAY}/agents", methods=["GET"])
 @require_auth
 @require_user_permission("bdv.play")
@@ -839,8 +818,8 @@ def playable_agents():
                     }
                     for row in rows
                 ],
-                "price": _plugin_config("agent_match_token_cost", 10),
-                "max_agents": _plugin_config("agent_match_max_seats", 4),
+                "price": plugin_config("agent_match_token_cost", 10),
+                "max_agents": plugin_config("agent_match_max_seats", 4),
                 "balance": _token_balance(_current_user_id()),
             }
         ),
@@ -880,7 +859,7 @@ def create_agent_match():
         return jsonify({"error": "that board is not published"}), 422
 
     agent_ids = data.get("agent_ids") or []
-    maximum = int(_plugin_config("agent_match_max_seats", 4))
+    maximum = int(plugin_config("agent_match_max_seats", 4))
     if not 2 <= len(agent_ids) <= maximum:
         return jsonify({"error": f"pick between 2 and {maximum} agents"}), 422
 
@@ -892,7 +871,7 @@ def create_agent_match():
         profiles.append(profile)
 
     user_id = _current_user_id()
-    price = int(_plugin_config("agent_match_token_cost", 10))
+    price = int(plugin_config("agent_match_token_cost", 10))
     if price > 0:
         try:
             _token_service().debit_tokens(

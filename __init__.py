@@ -177,22 +177,16 @@ class BdvPlugin(BasePlugin):
         from vbwd.extensions import db
 
         from plugins.bdv.bdv.bot.consumer import BdvBotConsumer, text_reply
-        from plugins.bdv.bdv.repositories.match_repository import (
-            ActionRepository,
-            MatchRepository,
-            OfferRepository,
-        )
-        from plugins.bdv.bdv.services.match_service import MatchService
+        from plugins.bdv.bdv.repositories.match_repository import MatchRepository
+        from plugins.bdv.bdv.services.service_factory import build_match_service
 
         matches = MatchRepository(db.session)
         consumer = BdvBotConsumer(
             matches,
-            MatchService(
-                db.session,
-                matches,
-                ActionRepository(db.session),
-                OfferRepository(db.session),
-            ),
+            # The SAME factory the REST surface uses. Built separately, the two
+            # drifted: a table played by models over REST played by the
+            # deterministic baseline over chat.
+            build_match_service(matches),
             _resolve_linked_user_id,
         )
         try:

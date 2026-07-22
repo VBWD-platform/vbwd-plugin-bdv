@@ -71,5 +71,12 @@
     "min": 2,
     "max": 6,
     "description": "How many agents a viewer may put in one fight."
+  },
+  "agent_max_llm_calls_per_request": {
+    "type": "integer",
+    "default": 2,
+    "min": 0,
+    "max": 20,
+    "description": "How many model-driven moves one request may play. Agents advance inline, so this bounds request latency; the client polls and the match walks on. 0 forces every agent to the deterministic baseline."
   }
 }

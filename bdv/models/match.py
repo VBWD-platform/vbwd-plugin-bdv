@@ -146,6 +146,11 @@ class BdvSeat(BaseModel):
     #: Written ONCE, when the match finishes — see the agent-roster migration.
     final_cash = db.Column(db.Integer, nullable=True)
     is_winner = db.Column(db.Boolean, nullable=True)
+    #: LLM budget state. Persisted because the seat driver is rebuilt on every
+    #: request — in memory, a spent budget would reset between polls and a seat
+    #: that had failed hard would be retried forever.
+    llm_tokens_spent = db.Column(db.Integer, nullable=False, server_default="0")
+    llm_degraded = db.Column(db.Boolean, nullable=False, server_default="false")
 
     def to_dict(self) -> dict:
         return {
@@ -181,6 +186,9 @@ class BdvAction(BaseModel):
     type = db.Column(db.String(40), nullable=False)
     payload = db.Column(db.JSON, nullable=True)
     events = db.Column(db.JSON, nullable=True)
+    #: Why an LLM seat chose this move. Kept OUT of ``payload`` because payload
+    #: is what replay folds — model prose must never sit on that path.
+    reasoning = db.Column(db.Text, nullable=True)
 
     def to_dict(self) -> dict:
         return {
@@ -190,6 +198,7 @@ class BdvAction(BaseModel):
             "type": self.type,
             "payload": self.payload or {},
             "events": self.events or [],
+            "reasoning": self.reasoning,
             "created_at": self.created_at.isoformat() if self.created_at else None,
         }
 

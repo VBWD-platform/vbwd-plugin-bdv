@@ -299,6 +299,7 @@ def build_llm_seat(
     *,
     client_factory: Callable[[Optional[str]], Any],
     max_repair_retries: int = 2,
+    fallback: Optional[BaselineSeat] = None,
 ) -> LlmSeat:
     """Build a seat from a ``bdv_agent_profile`` row.
 
@@ -314,4 +315,5 @@ def build_llm_seat(
         temperature=float(profile.temperature) if profile.temperature else None,
         max_repair_retries=max_repair_retries,
         token_budget=profile.max_tokens_per_match or None,
+        fallback=fallback,
     )

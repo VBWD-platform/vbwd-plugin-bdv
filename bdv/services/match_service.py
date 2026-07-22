@@ -64,11 +64,35 @@ class StaleStateError(MatchError):
 
 
 class MatchService:
-    def __init__(self, session, match_repository, action_repository, offer_repository):
+    def __init__(
+        self,
+        session,
+        match_repository,
+        action_repository,
+        offer_repository,
+        llm_client_factory=None,
+        max_llm_calls_per_request: int = 2,
+    ):
+        """
+        ``llm_client_factory`` maps a connection id to a core ``LlmClient``.
+        Injected rather than imported so the service never reaches into core's
+        container itself, and so every test runs without a provider. Left as
+        None, every agent plays the deterministic baseline — which is exactly
+        what the balance harness and the engine tests want.
+
+        ``max_llm_calls_per_request`` is the reason agent fights are usable at
+        all. ``advance_agents`` runs INLINE in the HTTP request, and a full
+        match is hundreds of decisions; unbounded, one poll would sit there
+        making provider calls until the request timed out. Instead a request
+        plays a couple of thought-out moves and returns — the client is already
+        polling, so the match walks forward a few moves at a time.
+        """
         self._session = session
         self._matches = match_repository
         self._actions = action_repository
         self._offers = offer_repository
+        self._llm_client_factory = llm_client_factory
+        self._max_llm_calls_per_request = max(0, int(max_llm_calls_per_request))
 
     # ------------------------------------------------------------ lifecycle
 
@@ -251,6 +275,11 @@ class MatchService:
 
         spec = self.spec_for(match)
         agent = BaselineSeat()
+        # One driver per seat, built once: an LlmSeat carries budget and
+        # degradation state that must survive the whole loop, not be rebuilt
+        # per move.
+        drivers = self._seat_drivers(match, agent, agent_seats)
+        llm_calls = 0
         played = 0
         for _ in range(max_actions):
             state = self.state_for(match)
@@ -284,18 +313,105 @@ class MatchService:
 
             if state.turn_seat not in agent_seats:
                 break
-            action = agent.next_action(state, spec, state.turn_seat)
+
+            driver = drivers.get(state.turn_seat, agent)
+            action, reasoning, used_model = self._decide(
+                driver, state, spec, state.turn_seat
+            )
             try:
                 self.submit(
                     match,
                     seat_index=action.seat_index,
                     action_type=action.type,
                     payload=dict(action.payload),
+                    reasoning=reasoning or None,
                 )
             except MatchError:
                 break
             played += 1
+            if used_model:
+                llm_calls += 1
+                # Stop while the request is still fast. The next poll picks the
+                # match up exactly where this one left it — the action log is
+                # the state, so nothing is held in memory between requests.
+                if llm_calls >= self._max_llm_calls_per_request:
+                    self._persist_llm_state(match, drivers)
+                    break
+        self._persist_llm_state(match, drivers)
         return played
+
+    def _seat_drivers(self, match: BdvMatch, fallback, agent_seats: set) -> Dict:
+        """Resolve each agent seat to the thing that will play it.
+
+        A seat becomes an ``LlmSeat`` only if it is bound to a profile with a
+        connection AND a client factory was injected. Everything else — an
+        unbound profile, a missing factory, a provider that will not build —
+        plays the deterministic baseline. A table must never fail to advance
+        because a model is unavailable.
+        """
+        from ..agents.llm_seat import build_llm_seat
+
+        drivers: Dict[int, object] = {}
+        if self._llm_client_factory is None:
+            return drivers
+
+        for seat in match.seats:
+            if seat.seat_index not in agent_seats or not seat.agent_profile_id:
+                continue
+            profile = self._agent_profile(seat.agent_profile_id)
+            if profile is None or not profile.llm_connection_id:
+                continue
+            try:
+                driver = build_llm_seat(
+                    profile,
+                    client_factory=self._llm_client_factory,
+                    max_repair_retries=2,
+                    fallback=fallback,
+                )
+            except Exception:
+                # No connection, no key, provider unavailable — the seat plays
+                # baseline rather than the match stalling.
+                continue
+            driver.tokens_spent = seat.llm_tokens_spent or 0
+            driver.degraded = bool(seat.llm_degraded)
+            drivers[seat.seat_index] = driver
+        return drivers
+
+    def _agent_profile(self, profile_id):
+        from ..models.match import BdvAgentProfile
+
+        return self._session.get(BdvAgentProfile, profile_id)
+
+    @staticmethod
+    def _decide(driver, state, spec, seat_index) -> Tuple[object, str, bool]:
+        """Ask a driver for its move, learning whether the model was consulted.
+
+        ``BaselineSeat`` has no ``decide`` — it is pure and free — so the
+        distinction is made here rather than by widening its interface for the
+        benefit of one caller.
+        """
+        decide = getattr(driver, "decide", None)
+        if decide is None:
+            return driver.next_action(state, spec, seat_index), "", False
+        decision = decide(state, spec, seat_index)
+        return decision.action, decision.reasoning, decision.attempts > 0
+
+    def _persist_llm_state(self, match: BdvMatch, drivers: Dict) -> None:
+        """Carry budget and degradation back to the seat rows.
+
+        Without this the driver's memory dies with the request: the per-match
+        token ceiling would never bind, and a seat that had exhausted its repair
+        retries would try the model again on the very next poll.
+        """
+        if not drivers:
+            return
+        for seat in match.seats:
+            driver = drivers.get(seat.seat_index)
+            if driver is None:
+                continue
+            seat.llm_tokens_spent = int(getattr(driver, "tokens_spent", 0))
+            seat.llm_degraded = bool(getattr(driver, "degraded", False))
+        self._session.flush()
 
     # ------------------------------------------------------------- reading
 
@@ -397,6 +513,7 @@ class MatchService:
         action_type: str,
         payload: Optional[Dict] = None,
         expected_seq: Optional[int] = None,
+        reasoning: Optional[str] = None,
     ) -> Tuple[MatchState, List[Dict]]:
         """The single mutating entry point. Optimistic concurrency, no locks."""
         if match.status == MATCH_STATUS_FINISHED:
@@ -419,7 +536,13 @@ class MatchService:
 
         seq = self._actions.next_seq(match.id)
         self._actions.log(
-            match.id, seq, seat_index, action_type, payload or {}, result.events
+            match.id,
+            seq,
+            seat_index,
+            action_type,
+            payload or {},
+            result.events,
+            reasoning=reasoning,
         )
         self._persist_state(match, result.state)
         return result.state, list(result.events)

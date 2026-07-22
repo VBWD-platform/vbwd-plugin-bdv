@@ -4,6 +4,7 @@ This is the proof that the pure engine and the persistence layer agree — the
 place where a fold-vs-snapshot divergence would show up.
 """
 import dataclasses
+import json
 
 import pytest
 
@@ -1194,7 +1195,187 @@ class TestPaidAgentFight:
 
     def test_the_price_falls_back_when_the_plugin_is_not_mounted(self, app):
         """A read must never 500 because the plugin manager is absent."""
-        from plugins.bdv.bdv.routes import _plugin_config
+        from plugins.bdv.bdv.services.service_factory import plugin_config
 
         with app.test_request_context():
-            assert isinstance(_plugin_config("agent_match_token_cost", 10), int)
+            assert isinstance(plugin_config("agent_match_token_cost", 10), int)
+
+
+class TestLlmSeatsActuallyPlay:
+    """The wiring, end to end — with a fake client, never a provider.
+
+    Until this slice the roster and the billing were real and the models were
+    not: every "LLM" seat quietly played the deterministic baseline.
+    """
+
+    class FakeClient:
+        """Answers with a legal move, and counts how often it was asked."""
+
+        def __init__(self, reply=None, explode=False):
+            self.calls = 0
+            self._reply = reply
+            self._explode = explode
+
+        def generate(self, system, user, **kwargs):
+            self.calls += 1
+            if self._explode:
+                raise RuntimeError("provider is down")
+            if self._reply is not None:
+                return self._reply
+            view = json.loads(user.split("\n\n")[0])
+            free = next(o for o in view["options"] if o["free"])
+            return {
+                "action": "choose_option",
+                "steps": free["steps"],
+                "reasoning": "taking the free sum",
+            }
+
+    @pytest.fixture
+    def profile(self, db):
+        from plugins.bdv.bdv.models.match import BdvAgentProfile
+        from vbwd.models.llm_connection import LlmConnection
+
+        connection = LlmConnection(
+            slug="test-adapter",
+            connection_name="Test",
+            api_key="k",
+            model="claude-test",
+            is_active=True,
+        )
+        db.session.add(connection)
+        db.session.flush()
+        row = BdvAgentProfile(
+            name="Model Player",
+            slug="model-player",
+            llm_connection_id=connection.id,
+            max_tokens_per_match=100000,
+        )
+        db.session.add(row)
+        db.session.flush()
+        return row
+
+    def _service(self, db, client, calls=2):
+        return MatchService(
+            db.session,
+            MatchRepository(db.session),
+            ActionRepository(db.session),
+            OfferRepository(db.session),
+            llm_client_factory=lambda _connection_id: client,
+            max_llm_calls_per_request=calls,
+        )
+
+    def _match(self, board, service, profile):
+        return service.create(
+            board,
+            created_by=None,
+            seats=[
+                {
+                    "kind": "llm",
+                    "agent_profile_id": profile.id,
+                    "display_name": "Model Player",
+                },
+                {"kind": "baseline", "display_name": "Baseline"},
+            ],
+            fill_policy="agents_now",
+        )
+
+    def test_the_model_is_consulted_and_its_move_is_played(self, db, board, profile):
+        client = self.FakeClient()
+        service = self._service(db, client)
+        service.advance_agents(self._match(board, service, profile))
+        assert client.calls > 0, "the seat never asked the model"
+
+    def test_the_reasoning_is_recorded_but_never_replayed(self, db, board, profile):
+        """Prose belongs beside the action, not inside its payload.
+
+        Payload is what the fold feeds to the engine; putting a model's text
+        there would put non-deterministic content on the replay path.
+        """
+        client = self.FakeClient()
+        service = self._service(db, client)
+        match = self._match(board, service, profile)
+        service.advance_agents(match)
+        db.session.flush()
+
+        rows = ActionRepository(db.session).for_match(match.id)
+        explained = [row for row in rows if row.reasoning]
+        assert explained, "no move carried its reasoning"
+        assert all("reasoning" not in (row.payload or {}) for row in rows)
+
+    def test_a_request_stops_after_its_model_budget(self, db, board, profile):
+        """Agents advance INLINE, so an unbounded loop would hang the request."""
+        client = self.FakeClient()
+        service = self._service(db, client, calls=1)
+        service.advance_agents(self._match(board, service, profile))
+        assert client.calls == 1
+
+        # The next poll picks the match up where this one stopped.
+        client.calls = 0
+        service.advance_agents(
+            MatchRepository(db.session).list_all(page=1, per_page=1)[0][0]
+        )
+        assert client.calls >= 1, "the match did not walk on"
+
+    def test_a_dead_provider_degrades_the_seat_instead_of_stalling(
+        self, db, board, profile
+    ):
+        client = self.FakeClient(explode=True)
+        service = self._service(db, client)
+        match = self._match(board, service, profile)
+        played = service.advance_agents(match)
+        assert played > 0, "a provider outage must not stop the table"
+
+    def test_degradation_survives_the_request(self, db, board, profile):
+        """The driver is rebuilt every request, so this has to be persisted.
+
+        In memory only, a seat that had exhausted its repair retries would ask
+        the failing model again on the very next poll — forever.
+        """
+        client = self.FakeClient(explode=True)
+        service = self._service(db, client)
+        match = self._match(board, service, profile)
+        service.advance_agents(match)
+        db.session.flush()
+
+        seat = next(s for s in match.seats if s.seat_index == 0)
+        assert seat.llm_degraded is True
+
+        client.calls = 0
+        service.advance_agents(match)
+        assert client.calls == 0, "a degraded seat asked the model again"
+
+    def test_a_spent_token_budget_binds_across_requests(self, db, board, profile):
+        profile.max_tokens_per_match = 1
+        db.session.flush()
+        client = self.FakeClient()
+        service = self._service(db, client)
+        match = self._match(board, service, profile)
+        service.advance_agents(match)
+        db.session.flush()
+        assert next(s for s in match.seats if s.seat_index == 0).llm_tokens_spent > 0
+
+        client.calls = 0
+        service.advance_agents(match)
+        assert client.calls == 0, "the per-match ceiling did not bind"
+
+    def test_an_illegal_move_is_refused_before_it_reaches_the_engine(
+        self, db, board, profile
+    ):
+        """A model asking for a move that is not on offer must not corrupt play."""
+        client = self.FakeClient(reply={"action": "choose_option", "steps": 99})
+        service = self._service(db, client)
+        match = self._match(board, service, profile)
+        played = service.advance_agents(match)
+        assert played > 0
+        assert client.calls > 1, "an illegal answer was not sent back for repair"
+
+    def test_without_a_factory_every_seat_plays_the_baseline(self, db, board, profile):
+        """The default path — what the harness and the engine tests rely on."""
+        service = MatchService(
+            db.session,
+            MatchRepository(db.session),
+            ActionRepository(db.session),
+            OfferRepository(db.session),
+        )
+        match = self._match(board, service, profile)
+        assert service.advance_agents(match) > 0

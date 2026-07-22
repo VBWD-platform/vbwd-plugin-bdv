@@ -118,7 +118,14 @@ class ActionRepository(BaseRepository[BdvAction]):
         super().__init__(session, BdvAction)
 
     def log(
-        self, match_id, seq: int, seat_index: int, type_: str, payload, events
+        self,
+        match_id,
+        seq: int,
+        seat_index: int,
+        type_: str,
+        payload,
+        events,
+        reasoning: Optional[str] = None,
     ) -> BdvAction:
         row = BdvAction(
             match_id=match_id,
@@ -127,6 +134,7 @@ class ActionRepository(BaseRepository[BdvAction]):
             type=type_,
             payload=payload or {},
             events=list(events or []),
+            reasoning=reasoning,
         )
         self._session.add(row)
         self._session.flush()
