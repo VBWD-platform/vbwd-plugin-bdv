@@ -22,18 +22,29 @@ class MatchRepository(BaseRepository[BdvMatch]):
     def list_for_user(
         self, user_id, *, page: int = 1, per_page: int = 20
     ) -> Tuple[List[BdvMatch], int]:
-        statement = (
-            self._session.query(BdvMatch)
-            .join(BdvSeat, BdvSeat.match_id == BdvMatch.id)
+        """Matches the user holds a seat in.
+
+        The id set is resolved FIRST, then the rows are fetched. A ``DISTINCT``
+        over the whole entity puts ``spec_snapshot`` / ``state_snapshot`` in the
+        SELECT list, and Postgres has no equality operator for ``json`` — so the
+        obvious ``query(BdvMatch).join(...).distinct()`` raises UndefinedFunction
+        the moment a single match exists.
+        """
+        seated = (
+            self._session.query(BdvSeat.match_id)
             .filter(BdvSeat.user_id == user_id)
             .distinct()
         )
         total = (
-            statement.with_entities(func.count(func.distinct(BdvMatch.id))).scalar()
+            self._session.query(func.count(BdvMatch.id))
+            .filter(BdvMatch.id.in_(seated))
+            .scalar()
             or 0
         )
         rows = (
-            statement.order_by(BdvMatch.created_at.desc())
+            self._session.query(BdvMatch)
+            .filter(BdvMatch.id.in_(seated))
+            .order_by(BdvMatch.created_at.desc())
             .limit(per_page)
             .offset((page - 1) * per_page)
             .all()

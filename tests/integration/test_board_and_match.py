@@ -229,3 +229,46 @@ class TestFullPersistedMatch:
         final = service.state_for(match)
         assert service.rebuild_state(match).state_hash() == final.state_hash()
         assert len(service.events_since(match)) > 50
+
+
+class TestMyMatchesList:
+    """Regression: listing a user's matches must not DISTINCT over json columns.
+
+    Postgres has no equality operator for `json`, so the obvious
+    `query(BdvMatch).join(seat).distinct()` 500s as soon as one match exists —
+    which is exactly what the lobby calls on every page load.
+    """
+
+    def test_lists_matches_the_user_is_seated_in(self, db, board, service):
+        from uuid import uuid4
+
+        from vbwd.models.user import User
+
+        user = User(
+            id=uuid4(),
+            email=f"player-{uuid4().hex[:8]}@example.com",
+            password_hash="x",
+        )
+        db.session.add(user)
+        db.session.flush()
+
+        service.create(
+            board,
+            created_by=user.id,
+            seats=[
+                {"kind": "human", "user_id": user.id, "display_name": "You"},
+                {"kind": "baseline", "display_name": "Agent 1"},
+                {"kind": "baseline", "display_name": "Agent 2"},
+            ],
+        )
+
+        rows, total = MatchRepository(db.session).list_for_user(user.id)
+        assert total == 1
+        assert len(rows) == 1
+        assert rows[0].state_snapshot is not None, "json column round-trips fine"
+
+    def test_returns_nothing_for_a_user_with_no_seat(self, db, board, service):
+        from uuid import uuid4
+
+        rows, total = MatchRepository(db.session).list_for_user(uuid4())
+        assert (rows, total) == ([], 0)
