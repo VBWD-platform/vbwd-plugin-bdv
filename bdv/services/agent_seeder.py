@@ -100,3 +100,57 @@ def seed_house_agents(session) -> Tuple[List, int]:
         rows.append(profile)
         created += 1
     return rows, created
+
+
+def bind_house_agents(session):
+    """Bind any UNBOUND house agent to a sensible LLM connection.
+
+    The seed ships agents unbound because no connection slug is knowable at seed
+    time. This is the follow-up an operator would otherwise do by hand: once a
+    connection exists, point the house agents at it so a fight runs real models
+    instead of the baseline.
+
+    Safe to run on prod and safe to repeat:
+
+    * it only ever binds an agent whose ``llm_connection_id`` is NULL, so an
+      admin's explicit choice is never overwritten (idempotent — a second run
+      binds nothing);
+    * it resolves the target unambiguously — the DEFAULT active connection, or
+      the sole active one if there is exactly one — and otherwise does nothing
+      rather than guess, because binding to the wrong provider is worse than
+      leaving an agent on the baseline.
+
+    Returns ``(connection_or_None, bound_count)``.
+    """
+    from vbwd.models.llm_connection import LlmConnection
+
+    from ..models.match import BdvAgentProfile
+
+    target = (
+        session.query(LlmConnection)
+        .filter(LlmConnection.is_default.is_(True), LlmConnection.is_active.is_(True))
+        .first()
+    )
+    if target is None:
+        actives = (
+            session.query(LlmConnection).filter(LlmConnection.is_active.is_(True)).all()
+        )
+        target = actives[0] if len(actives) == 1 else None
+    if target is None:
+        return None, 0
+
+    bound = 0
+    for spec in HOUSE_AGENTS:
+        agent = (
+            session.query(BdvAgentProfile)
+            .filter(
+                BdvAgentProfile.slug == spec["slug"],
+                BdvAgentProfile.llm_connection_id.is_(None),
+            )
+            .first()
+        )
+        if agent is not None:
+            agent.llm_connection_id = target.id
+            bound += 1
+    session.flush()
+    return target, bound

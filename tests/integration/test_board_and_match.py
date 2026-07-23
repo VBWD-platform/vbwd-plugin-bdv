@@ -1970,3 +1970,111 @@ class TestATurnWithNothingToDecideEndsItself:
         db.session.flush()
         kinds = [row.type for row in ActionRepository(db.session).for_match(match.id)]
         assert ActionType.END_TURN in kinds
+
+
+class TestBindingHouseAgents:
+    """Binding is a config change on existing rows — safe, idempotent, no guessing.
+
+    The seed ships agents unbound; this is the follow-up that makes a fight run
+    real models. It must never overwrite an admin's explicit choice, and must
+    never bind to the wrong provider when the target is ambiguous.
+    """
+
+    def _conn(self, db, slug, *, active=True, default=False):
+        from vbwd.models.llm_connection import LlmConnection
+
+        row = LlmConnection(
+            slug=slug,
+            connection_name=slug.title(),
+            api_key="k",
+            model="claude-test",
+            is_active=active,
+            is_default=default,
+        )
+        db.session.add(row)
+        db.session.flush()
+        return row
+
+    def test_the_sole_active_connection_is_used(self, db):
+        from plugins.bdv.bdv.services.agent_seeder import (
+            bind_house_agents,
+            seed_house_agents,
+        )
+
+        seed_house_agents(db.session)
+        conn = self._conn(db, "claude")
+        target, bound = bind_house_agents(db.session)
+        assert target.id == conn.id
+        assert bound == 3
+
+    def test_the_default_wins_over_other_active_connections(self, db):
+        from plugins.bdv.bdv.models.match import BdvAgentProfile
+        from plugins.bdv.bdv.services.agent_seeder import (
+            bind_house_agents,
+            seed_house_agents,
+        )
+
+        seed_house_agents(db.session)
+        self._conn(db, "openai")
+        chosen = self._conn(db, "claude", default=True)
+        target, bound = bind_house_agents(db.session)
+        assert target.slug == "claude"
+        assert bound == 3
+        rows = db.session.query(BdvAgentProfile).all()
+        assert all(r.llm_connection_id == chosen.id for r in rows)
+
+    def test_ambiguous_target_binds_nothing_rather_than_guessing(self, db):
+        from plugins.bdv.bdv.services.agent_seeder import (
+            bind_house_agents,
+            seed_house_agents,
+        )
+
+        seed_house_agents(db.session)
+        self._conn(db, "claude")
+        self._conn(db, "openai")  # two active, no default
+        target, bound = bind_house_agents(db.session)
+        assert (target, bound) == (None, 0), "must not guess between providers"
+
+    def test_no_connection_is_a_no_op(self, db):
+        from plugins.bdv.bdv.services.agent_seeder import (
+            bind_house_agents,
+            seed_house_agents,
+        )
+
+        seed_house_agents(db.session)
+        assert bind_house_agents(db.session) == (None, 0)
+
+    def test_an_explicit_binding_is_never_overwritten(self, db):
+        from plugins.bdv.bdv.models.match import BdvAgentProfile
+        from plugins.bdv.bdv.services.agent_seeder import (
+            bind_house_agents,
+            seed_house_agents,
+        )
+
+        seed_house_agents(db.session)
+        keep = self._conn(db, "hand-picked")
+        # An admin bound Ada by hand to a NON-default connection.
+        ada = (
+            db.session.query(BdvAgentProfile)
+            .filter(BdvAgentProfile.slug == "deal-hawk")
+            .first()
+        )
+        ada.llm_connection_id = keep.id
+        db.session.flush()
+        self._conn(db, "claude", default=True)
+
+        _target, bound = bind_house_agents(db.session)
+        assert bound == 2, "only the two still-unbound agents move"
+        db.session.refresh(ada)
+        assert ada.llm_connection_id == keep.id, "the hand-picked binding stands"
+
+    def test_a_second_run_binds_nothing(self, db):
+        from plugins.bdv.bdv.services.agent_seeder import (
+            bind_house_agents,
+            seed_house_agents,
+        )
+
+        seed_house_agents(db.session)
+        self._conn(db, "claude")
+        assert bind_house_agents(db.session)[1] == 3
+        assert bind_house_agents(db.session)[1] == 0, "idempotent"
